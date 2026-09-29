@@ -1,0 +1,370 @@
+#!/usr/bin/env bash
+#SBATCH -A nemotron_speechprod_tts
+#SBATCH -J nemotron_speechprod_tts:<placeholder-set-from-submit_chain.sh>
+#SBATCH -p polar3,polar4,polar
+#SBATCH -N 2
+#SBATCH -t 00:30:00
+#SBATCH --ntasks-per-node=8
+#SBATCH --cpus-per-task=12
+#SBATCH --hint=nomultithread
+#SBATCH --gpus-per-node=8
+#SBATCH --exclusive
+#SBATCH --mem=0
+#SBATCH --mail-type=FAIL
+set -euo pipefail
+
+# Submit via submit_chain.sh, which sets on the sbatch command line:
+#   - account (-A) and job name (-J), overriding the values above;
+#   - stdout/stderr logs (--output/--error) in <experiment dir>/slurm_logs/;
+#   - the submit directory (SLURM_SUBMIT_DIR), which is the directory
+#     containing this file and serves as the persistent experiment directory;
+#   - the experiment environment variables below (via --export);
+#   - for --debug runs, partition, node count, and time limit overrides.
+
+# Experiment values are supplied by submit_chain.sh.
+TRAIN_DEBUG_RUN="${TRAIN_DEBUG_RUN:-0}"
+: "${TRAINING_NAME:?submit_chain.sh must supply TRAINING_NAME}"
+if [[ "${TRAIN_DEBUG_RUN}" != "1" ]]; then
+    : "${WANDB_ENTITY:?submit_chain.sh must supply WANDB_ENTITY}"
+    : "${WANDB_PROJECT:?submit_chain.sh must supply WANDB_PROJECT}"
+    : "${WANDB_RUN_ID:?submit_chain.sh must supply WANDB_RUN_ID}"
+fi
+
+# Profiling controls inherited through submit_chain.sh's --export=ALL.
+PROFILE_MODE="${PROFILE_MODE:-light}"  # light: timeline; shapes: separate high-overhead diagnostic
+PROFILE_RANKS="${PROFILE_RANKS:-0,8}"  # one rank on each node of this 2x8-GPU allocation
+PROFILE_PYTHON_SAMPLING="${PROFILE_PYTHON_SAMPLING:-false}"
+PROFILE_START_STEP="${PROFILE_START_STEP:-100}"
+case "${PROFILE_MODE}" in
+    light) PROFILE_NUM_STEPS="${PROFILE_NUM_STEPS:-20}" ;;
+    shapes) PROFILE_NUM_STEPS="${PROFILE_NUM_STEPS:-3}" ;;
+    *) echo "PROFILE_MODE must be light or shapes" >&2; exit 1 ;;
+esac
+[[ "${PROFILE_RANKS}" =~ ^[0-9]+(,[0-9]+)*$ ]] || { echo "Invalid PROFILE_RANKS" >&2; exit 1; }
+[[ "${PROFILE_START_STEP}" =~ ^[1-9][0-9]*$ && "${PROFILE_NUM_STEPS}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "Profile start and length must be positive integers" >&2; exit 1;
+}
+[[ "${PROFILE_PYTHON_SAMPLING}" == true || "${PROFILE_PYTHON_SAMPLING}" == false ]] || exit 1
+if [[ "${TRAIN_DEBUG_RUN}" == "1" ]]; then
+    echo "For profiling use the normal allocation; debug mode changes ranks and batch limits." >&2
+    exit 1
+fi
+IFS=, read -r -a profile_rank_list <<< "${PROFILE_RANKS}"
+for rank in "${profile_rank_list[@]}"; do
+    (( 10#${rank} < ${SLURM_NTASKS:-16} )) || { echo "Profile rank ${rank} is outside the allocation" >&2; exit 1; }
+done
+
+# Repositories pinned by immutable commit ID.
+GIT_REPO="git@github.com:rfejgin/Speech.git"
+# Commit and publish the local profiling changes, then set this immutable pin.
+COMMIT_ID="${SPEECH_COMMIT_ID:?Set SPEECH_COMMIT_ID to the published 40-character SHA containing these changes}"
+DATA_REPO="ssh://git@gitlab-master.nvidia.com:12051/dl/sw-ai-app-design/magpie_pretraining_data.git"
+DATA_REPO_COMMIT_ID="9af2cae67bf896452c9139900c98d7e88826710c"
+
+for sha in "${COMMIT_ID}" "${DATA_REPO_COMMIT_ID}"; do
+    [[ "${sha}" =~ ^[0-9a-f]{40}$ ]] || { echo "Invalid commit ID (need a 40-character SHA): ${sha}" >&2; exit 1; }
+done
+
+# Host paths and commit-specific workspace.
+USER_ROOT="/lustre/fsw/portfolios/nemotron/projects/nemotron_speech_tts/users/rfejgin/tts_exp"
+CONTAINER="/lustre/fsw/portfolios/nemotron/projects/nemotron_speech_tts/users/ecasanova/docker_images/nemo_26.06_rc3_with_utmosv2_espeak-ng-lhotse-2.0.sqsh"
+MODEL_DIR=$USER_ROOT/models
+PHONEME_TOKENIZER_FILE="bpe_ipa_tokenizer_3072_en_de_es_fr_hi_it_vi_zh_ko-KR_pt-BR_ar_full_byte_espeak152_v2610_2026-08.json"
+
+
+WORKSPACE="${SLURM_SUBMIT_DIR:?SLURM_SUBMIT_DIR is not set}"
+LOG_DIR="${WORKSPACE}/logs"
+CODE_DIR="${WORKSPACE}/Speech"
+PRETRAINING_DATA_REPO="${WORKSPACE}/magpie_pretraining_data"
+ENV_FILE="${USER_ROOT}/setenv.sh"
+
+# Paths inside the container
+AUDIO_ROOT="s3://TTS/lhotse_datasets_2505"
+MANIFEST_ROOT="/data_configs/releases/v2610.rc1/pretraining/data"
+PHONEME_TOKENIZER_PATH="/model_artifacts/tokenizers/${PHONEME_TOKENIZER_FILE}"
+DAVIDAI_INPUT_CONFIG="${DAVIDAI_INPUT_CONFIG:-/data_configs/releases/v2610.rc1/pretraining/data/pre_training/train_all_multiturn_davidai.yaml}"
+
+# Data loader settings
+DATA_BUFFER_SIZE=500
+TTS_BUCKET_BINS="[8.6,9.36,10.1,10.84,11.61,12.42,13.28,14.16,15.12,16.12,17.2,18.33,19.44,20.0]"
+MULTITURN_BUCKET_BINS="[9.0,10.0,12.0,13.8,15.0,18.0,20.0,25.7,30.0,36.0,45.0,60.0,72.0,90.0,120.0,180.0]"
+MULTITURN_BATCH_SIZES="[20,18,15,13,12,10,9,7,6,5,4,3,2,2,1,1]"
+
+# Use a fresh output directory and five trailing batches to close the capture
+# before fit teardown. No validation/checkpoints run during this short profile.
+EXP_OUTPUT_DIR="/exp_dir/profile/${SLURM_JOB_ID}"
+RESUME_IF_EXISTS=false
+MAX_TIME_PER_RUN="00:00:20:00"
+MAX_STEPS=$((PROFILE_START_STEP + PROFILE_NUM_STEPS + 4))
+LIMIT_TRAIN_BATCHES=5000
+VAL_CHECK_INTERVAL=5000
+LIMIT_VAL_BATCHES=0
+(( MAX_STEPS < LIMIT_TRAIN_BATCHES )) || { echo "Keep this capture within the first epoch" >&2; exit 1; }
+WANDB_MODE=online
+WANDB_OVERRIDES="exp_manager.create_wandb_logger=true \
+  exp_manager.wandb_logger_kwargs.entity=${WANDB_ENTITY} \
+  exp_manager.wandb_logger_kwargs.project=${WANDB_PROJECT} \
+  exp_manager.wandb_logger_kwargs.name=${TRAINING_NAME} \
+  '+exp_manager.wandb_logger_kwargs.id=\"${WANDB_RUN_ID}\"' \
+  exp_manager.wandb_logger_kwargs.resume=false"
+
+# Checkouts are clones of the pinned commits and are never edited locally.
+# An existing clean checkout at a different commit is moved to the pin;
+# local modifications are an error rather than something to overwrite.
+ensure_checkout() {
+    local repo_dir="$1" sha="$2"
+    [[ -d "${repo_dir}/.git" ]] || { echo "${repo_dir} exists but is not a git checkout" >&2; exit 1; }
+    if [[ -n "$(git -C "${repo_dir}" status --porcelain)" ]]; then
+        echo "${repo_dir} has local modifications; refusing to use it:" >&2
+        git -C "${repo_dir}" status --short >&2
+        exit 1
+    fi
+    if [[ "$(git -C "${repo_dir}" rev-parse HEAD)" != "${sha}" ]]; then
+        echo "Moving ${repo_dir} to ${sha}"
+        git -C "${repo_dir}" cat-file -e "${sha}^{commit}" 2>/dev/null || git -C "${repo_dir}" fetch --quiet origin
+        git -C "${repo_dir}" checkout --quiet "${sha}"
+    fi
+    [[ "$(git -C "${repo_dir}" rev-parse HEAD)" == "${sha}" ]] || { echo "${repo_dir} is not at ${sha}" >&2; exit 1; }
+}
+
+mkdir -p "${WORKSPACE}"
+
+if [[ ! -e "${CODE_DIR}" ]]; then
+    git clone --filter=blob:none --no-checkout "${GIT_REPO}" "${CODE_DIR}"
+    git -C "${CODE_DIR}" checkout --quiet "${COMMIT_ID}"
+fi
+ensure_checkout "${CODE_DIR}" "${COMMIT_ID}"
+
+# Data repository: sparse checkout of v2610 release data, with LFS disabled.
+export GIT_LFS_SKIP_SMUDGE=1
+if [[ ! -e "${PRETRAINING_DATA_REPO}" ]]; then
+    git clone --no-checkout --filter=blob:none "${DATA_REPO}" "${PRETRAINING_DATA_REPO}"
+    git -C "${PRETRAINING_DATA_REPO}" sparse-checkout init --cone
+    git -C "${PRETRAINING_DATA_REPO}" sparse-checkout set releases/v2610.rc1/pretraining/data
+    git -C "${PRETRAINING_DATA_REPO}" checkout --quiet "${DATA_REPO_COMMIT_ID}"
+fi
+ensure_checkout "${PRETRAINING_DATA_REPO}" "${DATA_REPO_COMMIT_ID}"
+unset GIT_LFS_SKIP_SMUDGE
+
+echo "Speech commit: ${COMMIT_ID}"
+echo "Data commit: ${DATA_REPO_COMMIT_ID}"
+
+
+
+if [[ -f "${ENV_FILE}" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "${ENV_FILE}"
+    # override temporaly back to IAD, because to many failures with ORD
+    #export AIS_ENDPOINT="http://asr.iad.oci.aistore.nvidia.com:51080"
+    #echo "AIS_ENDPOINT=${AIS_ENDPOINT}"
+    set +a
+fi
+
+: "${AIS_AUTHN_TOKEN:?Set AIS_AUTHN_TOKEN or provide ${ENV_FILE}}"
+if [[ "${TRAIN_DEBUG_RUN}" != "1" ]]; then
+    : "${WANDB_API_KEY:?Set WANDB_API_KEY or provide ${ENV_FILE}}"
+fi
+: "${AIS_ENDPOINT:?Set AIS_ENDPOINT in ${ENV_FILE}}"
+: "${AIS_CLIENT_CA:?Set AIS_CLIENT_CA in ${ENV_FILE}}"
+#: "${AWS_SHARED_CREDENTIALS_FILE:?Set AWS_SHARED_CREDENTIALS_FILE in ${ENV_FILE}}"
+if [[ ! -f "${MODEL_DIR}/tokenizers/${PHONEME_TOKENIZER_FILE}" ]]; then
+    echo "Missing phoneme tokenizer: ${MODEL_DIR}/tokenizers/${PHONEME_TOKENIZER_FILE}" >&2
+    exit 1
+fi
+
+export AIS_ENDPOINT
+export AIS_CLIENT_CA
+#export AWS_SHARED_CREDENTIALS_FILE
+export HYDRA_FULL_ERROR=1
+export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1
+
+mkdir -p "${WORKSPACE}" "${LOG_DIR}" "${USER_ROOT}/cache/triton"
+
+# Each mount is written once as HOST_PATH:CONTAINER_PATH.
+MOUNT_SPECS=(
+    "${CODE_DIR}:/code"
+    "${PRETRAINING_DATA_REPO}:/data_configs"
+    "${MODEL_DIR}:/model_artifacts"
+    "/lustre/fsw/portfolios/nemotron/projects/nemotron_speech_tts/data/raw_audio_data:/data/TTS"
+    "/lustre/fsw/portfolios/nemotron/projects/nemotron_speech_tts/data/cache:/cache"
+    "${USER_ROOT}/cache/triton:/triton_cache"
+    "${AIS_CLIENT_CA}:${AIS_CLIENT_CA}"
+    "${WORKSPACE}:/exp_dir"
+)
+#    "${AWS_SHARED_CREDENTIALS_FILE}:${AWS_SHARED_CREDENTIALS_FILE}"
+MOUNTS="$(IFS=,; echo "${MOUNT_SPECS[*]}")"
+
+
+
+cmd=$(cat <<EOF_CMD
+set -euo pipefail
+cd /code
+export PYTHONPATH="/code:\${PYTHONPATH:-}"
+export AIS_ENDPOINT
+export AIS_AUTHN_TOKEN="${AIS_AUTHN_TOKEN}"
+export AIS_CLIENT_CA
+export AWS_SHARED_CREDENTIALS_FILE
+export WANDB_API_KEY="${WANDB_API_KEY:-}"
+export WANDB_MODE="${WANDB_MODE}"
+export MANIFEST_ROOT="${MANIFEST_ROOT}"
+export AUDIO_ROOT="${AUDIO_ROOT}"
+export HF_HOME="/cache/huggingface"
+export TORCH_HOME="/cache/torch"
+export NEMO_CACHE_DIR="/cache/torch/nemo"
+export TRITON_CACHE_DIR="/triton_cache"
+export TMPDIR="/cache/tmp"
+export HF_HUB_OFFLINE=1
+export PYTHONUNBUFFERED=1
+export PYTHONFAULTHANDLER=1
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+if [[ "\${SLURM_LOCALID:-0}" == "0" ]]; then
+    echo "NeMo commit: ${COMMIT_ID}"
+    echo "Data commit: ${DATA_REPO_COMMIT_ID}"
+fi
+
+# The same batch window is selected on all ranks; only selected ranks run nsys.
+NSYS_PREFIX=()
+case ",${PROFILE_RANKS}," in
+  *",\${SLURM_PROCID},"*)
+    command -v nsys >/dev/null 2>&1 || { echo "nsys is required on profiled ranks" >&2; exit 1; }
+    mkdir -p /exp_dir/nsys/${SLURM_JOB_ID}/${PROFILE_MODE}
+    NSYS_PREFIX=(nsys profile --trace=cuda,nvtx,osrt,nccl --sample=none --cpuctxsw=none
+      --capture-range=cudaProfilerApi --capture-range-end=stop
+      --python-sampling=${PROFILE_PYTHON_SAMPLING} --python-sampling-frequency=200
+      --output=/exp_dir/nsys/${SLURM_JOB_ID}/${PROFILE_MODE}/rank\${SLURM_PROCID}
+      --force-overwrite=false)
+    if [[ "${PROFILE_MODE}" == shapes ]]; then
+        NSYS_PREFIX+=(--pytorch=autograd-shapes-nvtx)
+    fi
+    nsys --version
+    ;;
+esac
+
+"\${NSYS_PREFIX[@]}" python examples/tts/easy_magpietts.py \
+  --config-name=easy_magpietts_lhotse_multiturn \
+  +exp_manager.explicit_log_dir=${EXP_OUTPUT_DIR} \
+  +exp_manager.max_time_per_run=${MAX_TIME_PER_RUN} \
+  exp_manager.resume_if_exists=${RESUME_IF_EXISTS} \
+  exp_manager.resume_ignore_no_checkpoint=true \
+  exp_manager.create_tensorboard_logger=false \
+  exp_manager.create_checkpoint_callback=false \
+  ${WANDB_OVERRIDES} \
+  model.decoder_type=nemotron_h \
+  model.nemotron_h_config.n_routed_experts=24 \
+  model.nemotron_h_config.num_experts_per_tok=4 \
+  model.nemotron_h_config.moe_intermediate_size=768 \
+  'model.nemotron_h_config.hybrid_override_pattern=MEMEM*EMEMEM*EMEMEMEM*EMEMEMEME' \
+  model.nemotron_h_config.num_hidden_layers=31 \
+  model.nemotron_h_config.residual_in_fp32=false \
+  ~model.training_modes \
+  '+model.training_modes=[{text_input_mode:streaming,streaming_phonemes_delay:3,streaming_speech_delay:5}]' \
+  model.phoneme_tokenizer.tokenizer_path=${PHONEME_TOKENIZER_PATH} \
+  'model.ignore_phoneme_languages=[vi,zh,ja,ko]' \
+  model.add_language_to_context_text=true \
+  model.enable_phoneme_text_input=true \
+  model.partial_phoneme_text_prob=0.5 \
+  model.partial_phoneme_portion_min=0.0 \
+  model.partial_phoneme_portion_max=1.0 \
+  model.frame_stacking_factor=1 \
+  model.local_transformer_type=none \
+  +model.acoustic_codes_predictor=true \
+  '+model.acoustic_codes_predictor_schedule=[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]' \
+  +model.use_codec_latent_audio_embedding=true \
+  '+model.feature_masking={_target_:nemo.collections.tts.modules.magpietts_modules.FeatureMasking,hidden_size:1536,mask_max:0.5}' \
+  +model.ignore_manifest_context_text=true \
+  trainer.max_steps=${MAX_STEPS} \
+  model.train_ds.dataset.tts_data.batch_duration=250 \
+  ~quadratic_duration \
+  model.train_ds.dataset.tts_data.quadratic_duration=null \
+  +model.train_ds.dataset.tts_data.bucket_duration_bins=${TTS_BUCKET_BINS} \
+  ++model.train_ds.dataset.tts_data.max_duration=30.0 \
+  ++model.train_ds.dataset.num_workers=4 \
+  model.train_ds.dataset.tts_data.input_cfg=${MANIFEST_ROOT}/pre_training/train_all_singleturn.yaml \
+  +model.train_ds.dataset.tts_data.reweight_temperature=0.7 \
+  model.train_ds.dataset.tts_data.bucket_buffer_size=${DATA_BUFFER_SIZE} \
+  model.train_ds.dataset.tts_data.shuffle_buffer_size=${DATA_BUFFER_SIZE} \
+  model.train_ds.dataset.sampler_weights.tts_data=0.7461306048 \
+  model.train_ds.dataset.sampler_weights.duplex_data=0.0460817662 \
+  ++model.train_ds.dataset.sampler_weights.davidai_user_assistent=0.2077876290 \
+  model.train_ds.dataset.duplex_data.bucket_duration_bins="${MULTITURN_BUCKET_BINS}" \
+  model.train_ds.dataset.duplex_data.bucket_batch_size="${MULTITURN_BATCH_SIZES}" \
+  model.train_ds.dataset.duplex_data.input_cfg=${MANIFEST_ROOT}/pre_training/train_all_multiturn_gretel.yaml \
+  model.train_ds.dataset.duplex_data.bucket_buffer_size=${DATA_BUFFER_SIZE} \
+  model.train_ds.dataset.duplex_data.shuffle_buffer_size=${DATA_BUFFER_SIZE} \
+  ++model.train_ds.dataset.davidai_user_assistent.input_cfg=${DAVIDAI_INPUT_CONFIG} \
+  ++model.train_ds.dataset.davidai_user_assistent.use_bucketing=true \
+  ++model.train_ds.dataset.davidai_user_assistent.bucket_buffer_size=${DATA_BUFFER_SIZE} \
+  ++model.train_ds.dataset.davidai_user_assistent.shuffle_buffer_size=${DATA_BUFFER_SIZE} \
+  ++model.train_ds.dataset.davidai_user_assistent.bucket_duration_bins="${MULTITURN_BUCKET_BINS}" \
+  ++model.train_ds.dataset.davidai_user_assistent.bucket_batch_size="${MULTITURN_BATCH_SIZES}" \
+  ++model.train_ds.dataset.davidai_user_assistent.truncate_duration=180.0 \
+  ++model.train_ds.dataset.davidai_user_assistent.max_duration=180.0 \
+  ++model.train_ds.dataset.davidai_user_assistent.truncate_offset_type=start \
+  ++model.train_ds.dataset.davidai_user_assistent.excluded_speaker_ids=${MANIFEST_ROOT}/test_multiturn_speakers.yaml \
+  ++model.train_ds.dataset.davidai_user_assistent.speaker_filter_fields='["speaker_id"]' \
+  ~model.validation_ds \
+  +model.validation_ds.dataset._target_=nemo.collections.tts.data.text_to_speech_dataset.MagpieTTSDataset \
+  +model.validation_ds.dataset.min_duration=0.2 \
+  +model.validation_ds.dataset.max_duration=20.0 \
+  +model.validation_ds.dataloader_params.batch_size=16 \
+  +model.validation_ds.dataloader_params.num_workers=2 \
+  +model.validation_ds.dataloader_params.pin_memory=true \
+  '+model.validation_ds.dataset.dataset_meta={my_val_data:{manifest_path:/data/TTS/manifests/dev_clean_withContextAudio_604samples_ipaNG_US_152.json,audio_dir:/data/TTS/LibriTTS,tokenizer_names:[nemotron_nano_30b]},de_val_data:{manifest_path:/data/TTS/CML/manifests_with_codecs/cml_tts_dataset_german_v0.1/dev_100subset_ipaNG_152.json,audio_dir:/data/TTS/CML/cml_tts_dataset_german_v0.1,tokenizer_names:[nemotron_nano_30b]},es_val_data:{manifest_path:/data/TTS/CML/manifests_with_codecs/cml_tts_dataset_spanish_v0.1/dev_100subset_ipaNG_152.json,audio_dir:/data/TTS/CML/cml_tts_dataset_spanish_v0.1,tokenizer_names:[nemotron_nano_30b]},fr_val_data:{manifest_path:/data/TTS/CML/manifests_with_codecs/cml_tts_dataset_french_v0.1/dev_100subset_ipaNG_152.json,audio_dir:/data/TTS/CML/cml_tts_dataset_french_v0.1,tokenizer_names:[nemotron_nano_30b]},it_val_data:{manifest_path:/data/TTS/CML/manifests_with_codecs/cml_tts_dataset_italian_v0.1/dev_100subset_ipaNG_152.json,audio_dir:/data/TTS/CML/cml_tts_dataset_italian_v0.1,tokenizer_names:[nemotron_nano_30b]},hi_val_data:{manifest_path:/data/TTS/evaluation_manifests/hindi_100subset_basic_ipaNG_152.json,audio_dir:/data/TTS/Hindi,tokenizer_names:[nemotron_nano_30b]},zh_val_data:{manifest_path:/data/TTS/evaluation_manifests/zh_riva_100subset_ipaNG_152.json,audio_dir:/data/TTS/riva/zh,tokenizer_names:[nemotron_nano_30b]},vi_val_data:{manifest_path:/data/TTS/evaluation_manifests/vi_100subset_test_ipaNG_152.json,audio_dir:/data/TTS/VietnameseEvaluationData/vi,tokenizer_names:[nemotron_nano_30b]}}' \
+  +model.run_val_inference=true \
+  +model.use_multilingual_asr=true \
+  +model.use_multiturn_dataset=true \
+  +model.use_speaker_encoder=true \
+  +model.train_shuffle_context_embedding_prob=0.1 \
+  +model.disable_subword_embedding=true \
+  +model.mask_user_on_loss=true \
+  +model.use_user_speaking_end_token=true \
+  +model.use_user_speaking_token=true \
+  +model.drop_eos_from_audio_input_sample_prob=0.10 \
+  +model.drop_eos_from_audio_input_frame_prob=0.2 \
+  ++model.condition_on_user_speech=true \
+  ++model.user_cond_trim_augmentation_sample_prob=0.5 \
+  ++model.user_cond_trim_augmentation_turn_prob=0.5 \
+  ++model.user_cond_trim_augmentation_base=5 \
+  ++model.user_cond_silence_augmentation_prob=0.1 \
+  ++model.user_cond_sample_silence_augmentation_prob=0.1 \
+  ++model.phoneme_loss_mask_padding=true \
+  model.context_duration_min=3.0 \
+  model.context_duration_max=10.0 \
+  model.codecmodel_path=/model_artifacts/acoustic_codec_fps12_codebooks16-epoch49-no-w2v.nemo \
+  model.load_cached_codes_if_available=false \
+  +model.vector_quantizer._target_=nemo.collections.tts.modules.audio_codec_modules.GroupFiniteScalarQuantizer \
+  +model.vector_quantizer.num_groups=16 \
+  '+model.vector_quantizer.num_levels_per_group=[4,4,4,4,4,4]' \
+  +model.use_bpe_char_tokenizer=true \
+  trainer.limit_train_batches=${LIMIT_TRAIN_BATCHES} \
+  trainer.val_check_interval=${VAL_CHECK_INTERVAL} \
+  ++trainer.limit_val_batches=${LIMIT_VAL_BATCHES} \
+  model.optim.lr=1e-4 \
+  trainer.num_nodes=\${SLURM_JOB_NUM_NODES:-1} \
+  ++trainer.enable_progress_bar=false \
+  ++model.profile_sections=true \
+  ++model.profile_sections_interval=50 \
+  ++model.profile_sections_sync=false \
+  ++model.nsys_profile_start_step=${PROFILE_START_STEP} \
+  ++model.nsys_profile_num_steps=${PROFILE_NUM_STEPS} \
+  '++model.nsys_profile_ranks=[${PROFILE_RANKS}]' \
+  '++model.profile_moe_layers=[1,15,30]' \
+  ++model.profile_metadata_dir=/exp_dir/nsys/${SLURM_JOB_ID}/${PROFILE_MODE}/metadata \
+  ++trainer.num_sanity_val_steps=0 \
+  ++trainer.accumulate_grad_batches=1
+EOF_CMD
+)
+
+unset CUDA_LAUNCH_BLOCKING
+srun \
+  --kill-on-bad-exit=1 \
+  --cpus-per-task=12 \
+  --cpu-bind=verbose,cores \
+  --hint=nomultithread \
+  --output="${LOG_DIR}/%j-%t.stdout" \
+  --error="${LOG_DIR}/%j-%t.stderr" \
+  --no-container-mount-home \
+  --container-image="${CONTAINER}" \
+  --container-mounts="${MOUNTS}" \
+  bash -c "${cmd}"
