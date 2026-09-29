@@ -33,6 +33,7 @@ from nemo.collections.tts.modules.nemotron_h_decoder import (
     NemotronHRMSNorm,
 )
 from nemo.collections.tts.parts.utils.helpers import get_mask_from_lengths
+from nemo.collections.tts.parts.utils.tts_profiling import module_profile_range
 from nemo.core.classes.common import safe_instantiate
 from nemo.core.classes.module import NeuralModule
 from nemo.utils import logging
@@ -1003,37 +1004,38 @@ class AcousticCodesPredictor(torch.nn.Module):
         previous_codebook_indices = None
 
         for block in self.blocks:
-            if previous_codes is not None:
-                embedded_codes = self._embed(previous_codes, previous_codebook_indices)
-                if feature_masking is not None:
-                    embedded_codes = feature_masking(inputs=embedded_codes, input_len=lengths)
-                hidden_states = hidden_states + embedded_codes
-            hidden_states = block(hidden_states)
-            logits = block.compute_logits(hidden_states)
+            with module_profile_range(block, 'predict_and_loss'):
+                if previous_codes is not None:
+                    embedded_codes = self._embed(previous_codes, previous_codebook_indices)
+                    if feature_masking is not None:
+                        embedded_codes = feature_masking(inputs=embedded_codes, input_len=lengths)
+                    hidden_states = hidden_states + embedded_codes
+                hidden_states = block(hidden_states)
+                logits = block.compute_logits(hidden_states)
 
-            first_code = block.codebook_indices[0]
-            last_code = block.codebook_indices[-1] + 1
-            block_is_supervised = supervised[:, :, first_code:last_code]
-            block_has_target = has_target[:, :, first_code:last_code]
-            block_targets = compact_targets[:, :, first_code:last_code]
-            step_targets = torch.where(
-                block_is_supervised,
-                block_targets,
-                torch.full_like(block_targets, _IGNORE_INDEX),
-            )
-            loss_sum = loss_sum + torch.nn.functional.cross_entropy(
-                logits.reshape(-1, self.num_output_tokens),
-                step_targets.reshape(-1),
-                ignore_index=_IGNORE_INDEX,
-                reduction='sum',
-            )
-            num_predictions = num_predictions + block_is_supervised.sum()
-            previous_codes = torch.where(
-                block_has_target,
-                target_codes[:, :, first_code:last_code],
-                torch.full_like(block_targets, self.mask_token_id),
-            )
-            previous_codebook_indices = block.codebook_indices
+                first_code = block.codebook_indices[0]
+                last_code = block.codebook_indices[-1] + 1
+                block_is_supervised = supervised[:, :, first_code:last_code]
+                block_has_target = has_target[:, :, first_code:last_code]
+                block_targets = compact_targets[:, :, first_code:last_code]
+                step_targets = torch.where(
+                    block_is_supervised,
+                    block_targets,
+                    torch.full_like(block_targets, _IGNORE_INDEX),
+                )
+                loss_sum = loss_sum + torch.nn.functional.cross_entropy(
+                    logits.reshape(-1, self.num_output_tokens),
+                    step_targets.reshape(-1),
+                    ignore_index=_IGNORE_INDEX,
+                    reduction='sum',
+                )
+                num_predictions = num_predictions + block_is_supervised.sum()
+                previous_codes = torch.where(
+                    block_has_target,
+                    target_codes[:, :, first_code:last_code],
+                    torch.full_like(block_targets, self.mask_token_id),
+                )
+                previous_codebook_indices = block.codebook_indices
 
         return loss_sum / num_predictions.clamp(min=1)
 

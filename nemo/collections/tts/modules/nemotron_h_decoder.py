@@ -30,6 +30,7 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import CrossEntropyLoss
 
+from nemo.collections.tts.parts.utils.tts_profiling import module_profile_range
 from nemo.utils import logging
 
 
@@ -1262,35 +1263,49 @@ class NemotronHMOE(nn.Module):
         Returns:
             Output tensor of shape (batch_size * seq_len, hidden_size)
         """
-        final_hidden_states = torch.zeros_like(hidden_states, dtype=topk_weights.dtype)
+        with module_profile_range(self, 'dispatch/one_hot', detail=True):
+            final_hidden_states = torch.zeros_like(hidden_states, dtype=topk_weights.dtype)
+            expert_mask = F.one_hot(topk_indices, num_classes=len(self.experts))
+            expert_mask = expert_mask.permute(2, 0, 1)
 
-        # Create one-hot mask for expert selection
-        expert_mask = F.one_hot(topk_indices, num_classes=len(self.experts))
-        expert_mask = expert_mask.permute(2, 0, 1)  # (num_experts, batch*seq, top_k)
-
+        session = getattr(self, '_tts_profile', None)
+        collect_counts = session is not None and session.recording_metadata and self._tts_profile_detail
+        counts = [] if collect_counts else None
         for expert_idx in range(len(self.experts)):
             expert = self.experts[expert_idx]
-            mask = expert_mask[expert_idx]
-            token_indices, weight_indices = torch.where(mask)
+            with module_profile_range(self, f'dispatch/expert{expert_idx}', detail=True):
+                mask = expert_mask[expert_idx]
+                token_indices, weight_indices = torch.where(mask)
+                # numel() reads an existing shape, adding no GPU reduction or D2H copy.
+                if collect_counts:
+                    counts.append(token_indices.numel())
+                if token_indices.numel() > 0:
+                    expert_weights = topk_weights[token_indices, weight_indices]
+                    expert_input = hidden_states[token_indices]
 
             if token_indices.numel() > 0:
-                # Get weights and inputs for this expert
-                expert_weights = topk_weights[token_indices, weight_indices]
-                expert_input = hidden_states[token_indices]
-
-                # Apply expert and weight the output
-                expert_output = expert(expert_input)
-                weighted_output = expert_output * expert_weights.unsqueeze(-1)
-
-                # Accumulate weighted outputs
-                final_hidden_states.index_add_(0, token_indices, weighted_output)
+                with module_profile_range(self, f'expert_compute/expert{expert_idx}', detail=True):
+                    expert_output = expert(expert_input)
+                with module_profile_range(self, f'combine/expert{expert_idx}', detail=True):
+                    weighted_output = expert_output * expert_weights.unsqueeze(-1)
+                    final_hidden_states.index_add_(0, token_indices, weighted_output)
             else:
-                # No-op compute to mark params as used (for distributed training)
-                expert_dtype = expert.down_proj.weight.dtype
-                dummy_input = torch.zeros_like(hidden_states[0]).unsqueeze(0).to(expert_dtype)
-                dummy_out = expert(dummy_input)
-                final_hidden_states = final_hidden_states + dummy_out * 0
+                with module_profile_range(self, f'empty_expert/expert{expert_idx}', detail=True):
+                    # Preserve the original no-op compute used by distributed training.
+                    expert_dtype = expert.down_proj.weight.dtype
+                    dummy_input = torch.zeros_like(hidden_states[0]).unsqueeze(0).to(expert_dtype)
+                    dummy_out = expert(dummy_input)
+                    final_hidden_states = final_hidden_states + dummy_out * 0
 
+        if collect_counts:
+            session.record(
+                'moe',
+                module=self._tts_profile_name,
+                input_shape=list(hidden_states.shape),
+                expert_assignments=counts,
+                top_k=topk_indices.shape[-1],
+                padding_included=True,
+            )
         return final_hidden_states.to(hidden_states.dtype)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1307,19 +1322,22 @@ class NemotronHMOE(nn.Module):
         orig_shape = hidden_states.shape
 
         # Route tokens to experts
-        topk_indices, topk_weights = self.gate(hidden_states)
+        with module_profile_range(self, 'router', detail=True):
+            topk_indices, topk_weights = self.gate(hidden_states)
 
         # Flatten for expert processing
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
 
         # Apply mixture of experts
-        hidden_states = self.moe(hidden_states, topk_indices, topk_weights)
+        with module_profile_range(self, 'routed_experts'):
+            hidden_states = self.moe(hidden_states, topk_indices, topk_weights)
 
         # Reshape back to original shape
         hidden_states = hidden_states.view(*orig_shape)
 
         # Add shared expert output
-        hidden_states = hidden_states + self.shared_experts(residuals)
+        with module_profile_range(self, 'shared_experts'):
+            hidden_states = hidden_states + self.shared_experts(residuals)
 
         return hidden_states
 
@@ -1361,12 +1379,13 @@ class NemotronHBlock(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ):
-        # Use torch.cuda.stream() to avoid NaN issues when using multiple GPUs
-        if hidden_states.is_cuda:
-            with torch.cuda.stream(torch.cuda.default_stream(hidden_states.device)):
+        with module_profile_range(self, self.block_type):
+            # Use torch.cuda.stream() to avoid NaN issues when using multiple GPUs
+            if hidden_states.is_cuda:
+                with torch.cuda.stream(torch.cuda.default_stream(hidden_states.device)):
+                    return self._forward_impl(hidden_states, cache_params, cache_position, attention_mask)
+            else:
                 return self._forward_impl(hidden_states, cache_params, cache_position, attention_mask)
-        else:
-            return self._forward_impl(hidden_states, cache_params, cache_position, attention_mask)
 
     def _forward_impl(
         self,

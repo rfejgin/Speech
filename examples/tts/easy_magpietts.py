@@ -17,6 +17,7 @@ import torch.multiprocessing as mp
 from omegaconf import OmegaConf, open_dict
 
 from nemo.collections.tts.models import EasyMagpieCFGDistillation, EasyMagpieTTSModel, EasyMagpieTTSModelOnlinePO
+from nemo.collections.tts.parts.utils.tts_lightning_profiler import TTSLightningProfiler
 from nemo.core.config import hydra_runner
 from nemo.utils import logging
 from nemo.utils.exp_manager import exp_manager
@@ -44,7 +45,13 @@ def main(cfg):
     # each worker, avoding the problematic CUDA state inheritance.
     mp.set_start_method("spawn", force=True)
 
-    trainer = pl.Trainer(**cfg.trainer)
+    trainer_kwargs = dict(cfg.trainer)
+    profiling = cfg.model.get('profile_sections', False) or cfg.model.get('nsys_profile_start_step') is not None
+    if profiling:
+        if trainer_kwargs.get('profiler') not in (None, 'simple'):
+            raise ValueError('TTS Nsight profiling cannot be combined with another Trainer profiler')
+        trainer_kwargs['profiler'] = TTSLightningProfiler()
+    trainer = pl.Trainer(**trainer_kwargs)
     trainer.callbacks.append(pl.callbacks.LearningRateMonitor(logging_interval='step', log_weight_decay=True))
     exp_manager(trainer, cfg.get("exp_manager", None))
 
@@ -74,7 +81,13 @@ def main(cfg):
         trainer.validate(model)
 
     if mode in _TRAIN_MODES:
-        trainer.fit(model)
+        if profiling:
+            trainer.profiler.bind(model)
+        try:
+            trainer.fit(model)
+        finally:
+            if profiling:
+                model._tts_profile.finish()
     elif mode == 'test':
         trainer.test(model)
 

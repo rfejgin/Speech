@@ -504,6 +504,42 @@ class TestMoELayer:
 
         assert output.shape == hidden_states.shape
 
+    def test_profiling_preserves_moe_outputs_gradients_and_empty_experts(self, moe_config, tmp_path):
+        import copy
+        import json
+        from types import SimpleNamespace
+
+        from nemo.collections.tts.parts.utils.tts_profiling import TTSProfileSession
+
+        torch.manual_seed(123)
+        original = NemotronHMOE(moe_config, layer_idx=3)
+        # Force two empty experts to exercise the DDP no-op path as well.
+        original.gate.e_score_correction_bias.copy_(torch.tensor([100.0, 100.0, -100.0, -100.0]))
+        instrumented = copy.deepcopy(original)
+        profile = TTSProfileSession(
+            {'profile_sections': True, 'profile_metadata_dir': str(tmp_path)},
+            cuda=SimpleNamespace(is_available=lambda: False),
+        )
+        instrumented._tts_profile = profile
+        instrumented._tts_profile_name = 'decoder.layers.3.mixer'
+        instrumented._tts_profile_detail = True
+        x = torch.randn(2, 3, moe_config.hidden_size, requires_grad=True)
+        y = x.detach().clone().requires_grad_()
+        expected = original(x)
+        expected.sum().backward()
+        profile.begin_iteration()
+        actual = instrumented(y)
+        actual.sum().backward()
+        profile.finish()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(y.grad, x.grad, rtol=0, atol=0)
+        for a, b in zip(original.parameters(), instrumented.parameters()):
+            torch.testing.assert_close(a.grad, b.grad, rtol=0, atol=0)
+        metadata = json.loads((tmp_path / 'rank0.json').read_text())
+        counts = metadata['records'][0]['expert_assignments']
+        assert counts == [6, 6, 0, 0]
+        assert sum(counts) == x.shape[0] * x.shape[1] * moe_config.num_experts_per_tok
+
     def test_model_with_moe_pattern(self, moe_config):
         """Test full model with MoE layer."""
         model = NemotronHModel(moe_config)

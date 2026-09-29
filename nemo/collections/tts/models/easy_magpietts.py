@@ -49,6 +49,7 @@ from nemo.collections.tts.parts.utils.helpers import (
     transcribe_with_whisper,
     transcribe_with_whisper_from_filepaths,
 )
+from nemo.collections.tts.parts.utils.tts_profiling import TTSProfileSession
 from nemo.core.classes.common import safe_instantiate
 from nemo.utils import logging
 
@@ -171,6 +172,18 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
             )
             self._utmos_calculator = UTMOSv2Calculator(device='cpu')
             logging.info("UTMOSv2 calculator initialized for validation naturalness scoring")
+
+        # Disabled by default. The entrypoint connects this session to Lightning's
+        # data-fetch boundaries, so capture includes complete training iterations.
+        self._tts_profile = TTSProfileSession(cfg)
+        if self._tts_profile.enabled:
+            for name, module in self.named_modules():
+                if type(module).__name__ in {'NemotronHBlock', 'NemotronHMOE', 'AcousticCodesPredictorBlock'}:
+                    module._tts_profile = self._tts_profile
+                    module._tts_profile_name = name
+                    module._tts_profile_detail = (
+                        type(module).__name__ == 'NemotronHMOE' and module.layer_idx in self._tts_profile.moe_layers
+                    )
 
     def _get_state_dict_keys_to_exclude(self):
         return super()._get_state_dict_keys_to_exclude() + [
@@ -1242,111 +1255,124 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
 
         full_embedding = context_embedding_padded + combined_channel_embedding
 
-        # 8. Forward pass through transformer
-        transformer_out = self.forward(
-            inputs_embeds=full_embedding,
-            attention_mask=get_mask_from_lengths(combined_channel_lens),
+        self._tts_profile.record_tensors(
+            'backbone',
+            {'input': full_embedding, 'valid_lengths': combined_channel_lens},
+            training_mode=selected_training_mode.name if selected_training_mode is not None else None,
         )
-        transformer_hidden_states = transformer_out.last_hidden_state  # (B, T_total, E)
-
-        # 9. Extract prediction embeddings and compute losses
-        # Audio predictions start at audio_delay
-        pred_embeddings = self.slice_sequence_embeddings(
-            transformer_hidden_states,
-            context_lens=audio_delay,
-            target_lens=audio_codes_lens_target,
-        )
-
-        # Project to audio logits
-        pred_embeddings_audio = self.audio_out_projection(pred_embeddings)
-        logits = self.final_proj(pred_embeddings_audio)
-
-        # Compute codebook loss
-        codebook_loss, _ = self.compute_loss(
-            logits,
-            audio_codes_target,
-            audio_codes_lens_target,
-            agent_mask_target=agent_mask if self.cfg.get("mask_user_on_loss", False) else None,
-        )
-        loss = self.parallel_codebook_loss_scale * codebook_loss
-
-        # Compute local transformer loss if applicable
-        local_transformer_loss = None
-        local_transformer_logits = None
-        if self.local_transformer_type != LocalTransformerType.NO_LT:
-            assert self.local_transformer_type == LocalTransformerType.AR, "Unexpected local transformer type"
-
-            if dropout_audio_conditioning:
-                lt_masking = self.feature_masking
-            else:
-                lt_masking = None
-
-            local_transformer_logits = self._lt_helper.compute_logits(
-                pred_embeddings, audio_codes_target, targets_offset_by_one=False, feature_masking=lt_masking
+        with self._tts_profile.range('backbone_forward'):
+            # 8. Forward pass through transformer
+            transformer_out = self.forward(
+                inputs_embeds=full_embedding,
+                attention_mask=get_mask_from_lengths(combined_channel_lens),
             )
-            local_transformer_loss, _ = self.compute_loss(
-                local_transformer_logits,
+            transformer_hidden_states = transformer_out.last_hidden_state  # (B, T_total, E)
+
+        with self._tts_profile.range('loss/codebook'):
+            # 9. Extract prediction embeddings and compute losses
+            # Audio predictions start at audio_delay
+            pred_embeddings = self.slice_sequence_embeddings(
+                transformer_hidden_states,
+                context_lens=audio_delay,
+                target_lens=audio_codes_lens_target,
+            )
+
+            # Project to audio logits
+            pred_embeddings_audio = self.audio_out_projection(pred_embeddings)
+            logits = self.final_proj(pred_embeddings_audio)
+
+            # Compute codebook loss
+            codebook_loss, _ = self.compute_loss(
+                logits,
                 audio_codes_target,
                 audio_codes_lens_target,
                 agent_mask_target=agent_mask if self.cfg.get("mask_user_on_loss", False) else None,
             )
+            loss = self.parallel_codebook_loss_scale * codebook_loss
 
-            loss = loss + self.local_transformer_loss_scale * local_transformer_loss
+        with self._tts_profile.range('loss/local_transformer'):
+            # Compute local transformer loss if applicable
+            local_transformer_loss = None
+            local_transformer_logits = None
+            if self.local_transformer_type != LocalTransformerType.NO_LT:
+                assert self.local_transformer_type == LocalTransformerType.AR, "Unexpected local transformer type"
 
-        acoustic_codes_predictor_loss = None
-        if self.acoustic_codes_predictor_enabled:
-            assert self.acoustic_codes_predictor is not None
-            predictor_targets, predictor_loss_mask = self._acoustic_codes_predictor_targets(
-                num_positions=transformer_hidden_states.size(1),
-                audio_codes_target=audio_codes_target,
-                audio_codes_lens_target=audio_codes_lens_target,
-                audio_delay=audio_delay,
-                loss_mask=agent_mask if self.cfg.get("mask_user_on_loss", False) else None,
-            )
-            acoustic_codes_predictor_loss = self.acoustic_codes_predictor.compute_loss(
-                hidden_states=transformer_hidden_states,
-                target_codes=predictor_targets,
-                lengths=combined_channel_lens,
-                loss_mask=predictor_loss_mask,
-                feature_masking=self.feature_masking if dropout_audio_conditioning else None,
-            )
-            loss = loss + self.acoustic_codes_predictor_loss_scale * acoustic_codes_predictor_loss
+                if dropout_audio_conditioning:
+                    lt_masking = self.feature_masking
+                else:
+                    lt_masking = None
 
-        # Compute phoneme loss if applicable
-        phoneme_loss = None
-        pb_phoneme_logits = None
-        pb_phoneme_tokens_target = None
-        pb_phoneme_tokens_lens_target = None
-        if self.phoneme_tokenizer is not None and phoneme_tokens_stacked is not None:
-            # Phoneme predictions start at phoneme_delay
-            pred_embeddings_phoneme = self.slice_sequence_embeddings(
-                transformer_hidden_states,
-                context_lens=phoneme_delay,
-                target_lens=phoneme_tokens_lens_stacked - 1,
-            )
-            pb_phoneme_logits = self.phoneme_final_proj(pred_embeddings_phoneme)
-            pb_phoneme_tokens_target = phoneme_tokens_stacked_clean[:, :, 1:].long()
-            pb_phoneme_tokens_lens_target = phoneme_tokens_lens_stacked - 1
-
-            if (phoneme_corruption_mode != 'repeat_skip') and not (
-                dropout_complete_phoneme_channel
-                or (phoneme_turn_dropout is not None and phoneme_turn_dropout.any())
-                or dropout_conditional_input
-                or dropout_text_input
-            ):
-                custom_mask = None
-                if self.cfg.get("phoneme_loss_mask_padding", False):
-                    custom_mask = pb_phoneme_tokens_target[:, 0, :] != self.phoneme_tokenizer.pad  # (B, T')
-                elif self.cfg.get("mask_user_on_loss", False):
-                    custom_mask = agent_mask
-
-                phoneme_loss, _ = self.compute_phoneme_loss(
-                    pb_phoneme_logits, pb_phoneme_tokens_target, pb_phoneme_tokens_lens_target, custom_mask=custom_mask
+                local_transformer_logits = self._lt_helper.compute_logits(
+                    pred_embeddings, audio_codes_target, targets_offset_by_one=False, feature_masking=lt_masking
                 )
-            else:
-                phoneme_loss = torch.tensor(0.0, device=logits.device)
+                local_transformer_loss, _ = self.compute_loss(
+                    local_transformer_logits,
+                    audio_codes_target,
+                    audio_codes_lens_target,
+                    agent_mask_target=agent_mask if self.cfg.get("mask_user_on_loss", False) else None,
+                )
 
-            loss = loss + self.phoneme_loss_weight * phoneme_loss
+                loss = loss + self.local_transformer_loss_scale * local_transformer_loss
+
+        with self._tts_profile.range('loss/acoustic_predictor'):
+            acoustic_codes_predictor_loss = None
+            if self.acoustic_codes_predictor_enabled:
+                assert self.acoustic_codes_predictor is not None
+                predictor_targets, predictor_loss_mask = self._acoustic_codes_predictor_targets(
+                    num_positions=transformer_hidden_states.size(1),
+                    audio_codes_target=audio_codes_target,
+                    audio_codes_lens_target=audio_codes_lens_target,
+                    audio_delay=audio_delay,
+                    loss_mask=agent_mask if self.cfg.get("mask_user_on_loss", False) else None,
+                )
+                acoustic_codes_predictor_loss = self.acoustic_codes_predictor.compute_loss(
+                    hidden_states=transformer_hidden_states,
+                    target_codes=predictor_targets,
+                    lengths=combined_channel_lens,
+                    loss_mask=predictor_loss_mask,
+                    feature_masking=self.feature_masking if dropout_audio_conditioning else None,
+                )
+                loss = loss + self.acoustic_codes_predictor_loss_scale * acoustic_codes_predictor_loss
+
+        with self._tts_profile.range('loss/phoneme'):
+            # Compute phoneme loss if applicable
+            phoneme_loss = None
+            pb_phoneme_logits = None
+            pb_phoneme_tokens_target = None
+            pb_phoneme_tokens_lens_target = None
+            if self.phoneme_tokenizer is not None and phoneme_tokens_stacked is not None:
+                # Phoneme predictions start at phoneme_delay
+                pred_embeddings_phoneme = self.slice_sequence_embeddings(
+                    transformer_hidden_states,
+                    context_lens=phoneme_delay,
+                    target_lens=phoneme_tokens_lens_stacked - 1,
+                )
+                pb_phoneme_logits = self.phoneme_final_proj(pred_embeddings_phoneme)
+                pb_phoneme_tokens_target = phoneme_tokens_stacked_clean[:, :, 1:].long()
+                pb_phoneme_tokens_lens_target = phoneme_tokens_lens_stacked - 1
+
+                if (phoneme_corruption_mode != 'repeat_skip') and not (
+                    dropout_complete_phoneme_channel
+                    or (phoneme_turn_dropout is not None and phoneme_turn_dropout.any())
+                    or dropout_conditional_input
+                    or dropout_text_input
+                ):
+                    custom_mask = None
+                    if self.cfg.get("phoneme_loss_mask_padding", False):
+                        custom_mask = pb_phoneme_tokens_target[:, 0, :] != self.phoneme_tokenizer.pad  # (B, T')
+                    elif self.cfg.get("mask_user_on_loss", False):
+                        custom_mask = agent_mask
+
+                    phoneme_loss, _ = self.compute_phoneme_loss(
+                        pb_phoneme_logits,
+                        pb_phoneme_tokens_target,
+                        pb_phoneme_tokens_lens_target,
+                        custom_mask=custom_mask,
+                    )
+                else:
+                    phoneme_loss = torch.tensor(0.0, device=logits.device)
+
+                loss = loss + self.phoneme_loss_weight * phoneme_loss
 
         return ProcessBatchOutput(
             loss=loss,
@@ -1367,15 +1393,27 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
         )
 
     def training_step(self, batch, batch_idx):
+        if self._tts_profile.recording_metadata:
+            self._tts_profile.record_tensors(
+                'batch',
+                batch,
+                batch_idx=batch_idx,
+                epoch=int(self.current_epoch),
+                global_step=int(self.global_step),
+                dataset_names=list(batch.get('dataset_names', []))[:128],
+                task=list(batch.get('task', []))[:128],
+            )
+
         if 'context_audio_codes' in batch:
             context_audio_codes = batch['context_audio_codes']
             context_audio_codes_lens = batch['context_audio_codes_lens']
         else:
             context_audio = batch['context_audio']
             context_audio_lens = batch['context_audio_lens']
-            context_audio_codes, context_audio_codes_lens = self._codec_helper.audio_to_codes(
-                context_audio, context_audio_lens
-            )
+            with self._tts_profile.range('codec_context'):
+                context_audio_codes, context_audio_codes_lens = self._codec_helper.audio_to_codes(
+                    context_audio, context_audio_lens
+                )
 
         if 'audio_codes' in batch:
             audio_codes = batch['audio_codes']
@@ -1383,7 +1421,8 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
         else:
             audio = batch['audio']
             audio_lens = batch['audio_lens']
-            audio_codes, audio_codes_lens = self._codec_helper.audio_to_codes(audio, audio_lens)
+            with self._tts_profile.range('codec_target'):
+                audio_codes, audio_codes_lens = self._codec_helper.audio_to_codes(audio, audio_lens)
 
         if (
             self.cfg.get("use_multiturn_dataset", False)
@@ -1448,10 +1487,11 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
                 if silence_mask.any():
                     user_audio[silence_mask] = 0.0
 
-            user_audio_codes, user_audio_codes_lens = self._codec_helper.audio_to_codes(
-                user_audio,
-                user_audio_lens,
-            )
+            with self._tts_profile.range('codec_user'):
+                user_audio_codes, user_audio_codes_lens = self._codec_helper.audio_to_codes(
+                    user_audio,
+                    user_audio_lens,
+                )
 
             if self._codec_converter is not None:
                 user_audio_codes = self._codec_converter.convert_original_to_new(
@@ -1488,168 +1528,179 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
                 sample_trim_aug = torch.zeros(B, device=user_audio_embedded.device, dtype=torch.bool)
 
             indices = batch["user_audio_turn_splitted_indices"].to(user_audio_embedded.device)
-            for turn_idx, (b, start_sample, end_sample) in enumerate(indices):
-                b = int(b.item())
-                if b < 0:
-                    continue
+            with self._tts_profile.range('user_turn_loop'):
+                for turn_idx, (b, start_sample, end_sample) in enumerate(indices):
+                    b = int(b.item())
+                    if b < 0:
+                        continue
 
-                start_frame = int(torch.ceil(start_sample.float() / input_samples_per_frame).item())
-                end_frame = int(end_sample.item()) // input_samples_per_frame
+                    start_frame = int(torch.ceil(start_sample.float() / input_samples_per_frame).item())
+                    end_frame = int(end_sample.item()) // input_samples_per_frame
 
-                start_frame = max(0, min(start_frame, T))
-                end_frame = max(start_frame, min(end_frame, T))
+                    start_frame = max(0, min(start_frame, T))
+                    end_frame = max(start_frame, min(end_frame, T))
 
-                seq_len = end_frame - start_frame
-                if seq_len <= 0:
-                    continue
+                    seq_len = end_frame - start_frame
+                    if seq_len <= 0:
+                        continue
 
-                turn_len_with_special = int(user_audio_codes_lens[turn_idx].item())
-                real_start = 1
-                real_end = max(real_start, turn_len_with_special - 1)
-                turn_emb = user_audio_embedded[turn_idx, real_start:real_end]
+                    turn_len_with_special = int(user_audio_codes_lens[turn_idx].item())
+                    real_start = 1
+                    real_end = max(real_start, turn_len_with_special - 1)
+                    turn_emb = user_audio_embedded[turn_idx, real_start:real_end]
 
-                copy_len = min(seq_len, turn_emb.size(0))
-                if copy_len <= 0:
-                    continue
+                    copy_len = min(seq_len, turn_emb.size(0))
+                    if copy_len <= 0:
+                        continue
 
-                turn_emb = turn_emb[:copy_len].clone()
+                    turn_emb = turn_emb[:copy_len].clone()
 
-                if bool(sample_trim_aug[b].item()):
-                    do_turn_aug = torch.rand((), device=user_audio_embedded.device).item() < turn_prob
+                    if bool(sample_trim_aug[b].item()):
+                        do_turn_aug = torch.rand((), device=user_audio_embedded.device).item() < turn_prob
 
-                    if do_turn_aug:
-                        trim_delta = int(
-                            torch.randint(
-                                low=-1,
-                                high=2,  # {-1, 0, 1}
-                                size=(),
-                                device=user_audio_embedded.device,
-                            ).item()
-                        )
+                        if do_turn_aug:
+                            trim_delta = int(
+                                torch.randint(
+                                    low=-1,
+                                    high=2,  # {-1, 0, 1}
+                                    size=(),
+                                    device=user_audio_embedded.device,
+                                ).item()
+                            )
 
-                        trim_amount = max(1, base_trim + trim_delta)
-                        trim_amount = min(trim_amount, max(1, copy_len - 1))
+                            trim_amount = max(1, base_trim + trim_delta)
+                            trim_amount = min(trim_amount, max(1, copy_len - 1))
 
-                        aug_choice = random.choices(
-                            ["left", "right", "both"],
-                            weights=[0.3, 0.3, 0.4],
-                            k=1,
-                        )[0]
+                            aug_choice = random.choices(
+                                ["left", "right", "both"],
+                                weights=[0.3, 0.3, 0.4],
+                                k=1,
+                            )[0]
 
-                        zero_emb_pad = turn_emb.new_zeros(trim_amount, turn_emb.size(-1))
+                            zero_emb_pad = turn_emb.new_zeros(trim_amount, turn_emb.size(-1))
 
-                        if aug_choice == "left":
-                            # Remove tokens from the left, then right-pad zeros.
-                            kept_emb = turn_emb[trim_amount:]
-                            turn_emb = torch.cat([kept_emb, zero_emb_pad], dim=0)
+                            if aug_choice == "left":
+                                # Remove tokens from the left, then right-pad zeros.
+                                kept_emb = turn_emb[trim_amount:]
+                                turn_emb = torch.cat([kept_emb, zero_emb_pad], dim=0)
 
-                        elif aug_choice == "right":
-                            # Remove tokens from the right, then right-pad zeros.
-                            kept_emb = turn_emb[: copy_len - trim_amount]
-                            turn_emb = torch.cat([kept_emb, zero_emb_pad], dim=0)
+                            elif aug_choice == "right":
+                                # Remove tokens from the right, then right-pad zeros.
+                                kept_emb = turn_emb[: copy_len - trim_amount]
+                                turn_emb = torch.cat([kept_emb, zero_emb_pad], dim=0)
 
-                        else:  # "both"
-                            # Remove trim_amount total tokens split across left and right.
-                            left_trim = trim_amount // 2
-                            right_trim = trim_amount - left_trim
+                            else:  # "both"
+                                # Remove trim_amount total tokens split across left and right.
+                                left_trim = trim_amount // 2
+                                right_trim = trim_amount - left_trim
 
-                            # If trim_amount is odd, randomly decide which side loses the extra token.
-                            if trim_amount % 2 == 1 and torch.rand((), device=user_audio_embedded.device).item() < 0.5:
-                                left_trim, right_trim = right_trim, left_trim
+                                # If trim_amount is odd, randomly decide which side loses the extra token.
+                                if (
+                                    trim_amount % 2 == 1
+                                    and torch.rand((), device=user_audio_embedded.device).item() < 0.5
+                                ):
+                                    left_trim, right_trim = right_trim, left_trim
 
-                            kept_emb = turn_emb[left_trim : copy_len - right_trim]
-                            turn_emb = torch.cat([kept_emb, zero_emb_pad], dim=0)
+                                kept_emb = turn_emb[left_trim : copy_len - right_trim]
+                                turn_emb = torch.cat([kept_emb, zero_emb_pad], dim=0)
 
-                        # Safety: keep exact same length for restore assignment.
-                        turn_emb = turn_emb[:copy_len]
+                            # Safety: keep exact same length for restore assignment.
+                            turn_emb = turn_emb[:copy_len]
 
-                dst_start = start_frame
-                dst_end = start_frame + copy_len
+                    dst_start = start_frame
+                    dst_end = start_frame + copy_len
 
-                user_audio_embedded_restored[b, dst_start:dst_end] = turn_emb
+                    user_audio_embedded_restored[b, dst_start:dst_end] = turn_emb
 
             user_audio_embedded = user_audio_embedded_restored
         else:
             user_audio_embedded = None
 
-        batch_output = self.process_batch(
-            text=batch['text'],
-            text_lens=batch['text_lens'],
-            context_text_tokens=batch['context_text_tokens'],
-            context_text_tokens_lens=batch['context_text_tokens_lens'],
-            audio_codes=audio_codes,
-            audio_codes_lens=audio_codes_lens,
-            context_audio_codes=context_audio_codes,
-            context_audio_codes_lens=context_audio_codes_lens,
-            phoneme_tokens=batch.get('phoneme_tokens'),
-            phoneme_tokens_lens=batch.get('phoneme_tokens_lens'),
-            phoneme_turn_dropout=batch.get('phoneme_turn_dropout'),
-            mode="train",
-            task=batch["task"] if self.cfg.get("use_multiturn_dataset", False) else None,
-            agent_mask=batch["agent_mask"] if self.cfg.get("use_multiturn_dataset", False) else None,
-            user_audio_embedded=user_audio_embedded,
-        )
-        loss = batch_output.loss
-        codebook_loss = batch_output.codebook_loss
-        self.log('train/codebook_loss', codebook_loss, prog_bar=True, sync_dist=True)
-        self.log('train/loss', loss, prog_bar=True, sync_dist=True)
-
-        if self.phoneme_tokenizer is not None:
-            phoneme_loss = batch_output.phoneme_loss
-            self.log('train/phoneme_loss', phoneme_loss, prog_bar=True, sync_dist=True)
-
-        local_transformer_loss = batch_output.local_transformer_loss
-        if local_transformer_loss is not None:
-            self.log('train/local_transformer_loss', local_transformer_loss, prog_bar=True, sync_dist=True)
-
-        acoustic_codes_predictor_loss = batch_output.acoustic_codes_predictor_loss
-        if acoustic_codes_predictor_loss is not None:
-            self.log('train/acoustic_codes_predictor_loss', acoustic_codes_predictor_loss, sync_dist=True)
-
-        # Log training mode info for multi-mode training
-        if batch_output.selected_training_mode is not None:
-            # Log which mode was selected for this batch
-            # Convert mode name to an index for logging
-            mode_idx = self.mode_name_to_mode[batch_output.selected_training_mode].mode_idx
-            self.log('train/training_mode_idx', float(mode_idx), on_step=True)
-
-        # Log batch info
-        batch_size, text_token_max_len = batch["text"].shape
-        text_token_total_num = batch["text_lens"].sum()
-        batch_info_dict = {
-            "train/batch_size": batch_size,
-            "train/text_token_max_len": text_token_max_len,
-            "train/text_token_total_num_in_batch": text_token_total_num,
-            "train/text_token_pad_ratio_percent_in_batch": 100
-            * (1 - text_token_total_num / (batch_size * text_token_max_len)),
-        }
-
-        if "audio_codes" in batch:
-            audio_codes_max_len = batch["audio_codes"].shape[-1]
-            audio_codes_total_num = batch["audio_codes_lens"].sum()
-            batch_info_dict.update(
-                {
-                    "train/audio_codes_max_len": audio_codes_max_len,
-                    "train/audio_codes_total_num_in_batch": audio_codes_total_num,
-                    "train/audio_codes_pad_ratio_percent_in_batch": 100
-                    * (1 - audio_codes_total_num / (batch_size * audio_codes_max_len)),
-                }
-            )
-        else:
-            audio_samples_max_len = batch["audio"].shape[-1]
-            audio_samples_total_num = batch["audio_lens"].sum()
-            batch_info_dict.update(
-                {
-                    "train/audio_samples_max_len": audio_samples_max_len,
-                    "train/audio_samples_total_num_in_batch": audio_samples_total_num,
-                    "train/audio_samples_pad_ratio_percent_in_batch": 100
-                    * (1 - audio_samples_total_num / (batch_size * audio_samples_max_len)),
-                }
+        with self._tts_profile.range('process_batch'):
+            batch_output = self.process_batch(
+                text=batch['text'],
+                text_lens=batch['text_lens'],
+                context_text_tokens=batch['context_text_tokens'],
+                context_text_tokens_lens=batch['context_text_tokens_lens'],
+                audio_codes=audio_codes,
+                audio_codes_lens=audio_codes_lens,
+                context_audio_codes=context_audio_codes,
+                context_audio_codes_lens=context_audio_codes_lens,
+                phoneme_tokens=batch.get('phoneme_tokens'),
+                phoneme_tokens_lens=batch.get('phoneme_tokens_lens'),
+                phoneme_turn_dropout=batch.get('phoneme_turn_dropout'),
+                mode="train",
+                task=batch["task"] if self.cfg.get("use_multiturn_dataset", False) else None,
+                agent_mask=batch["agent_mask"] if self.cfg.get("use_multiturn_dataset", False) else None,
+                user_audio_embedded=user_audio_embedded,
             )
 
-        self.log_dict(batch_info_dict, on_step=True)
+        with self._tts_profile.range('metric_logging'):
+            loss = batch_output.loss
+            codebook_loss = batch_output.codebook_loss
+            self.log('train/codebook_loss', codebook_loss, prog_bar=True, sync_dist=True)
+            self.log('train/loss', loss, prog_bar=True, sync_dist=True)
+
+            if self.phoneme_tokenizer is not None:
+                phoneme_loss = batch_output.phoneme_loss
+                self.log('train/phoneme_loss', phoneme_loss, prog_bar=True, sync_dist=True)
+
+            local_transformer_loss = batch_output.local_transformer_loss
+            if local_transformer_loss is not None:
+                self.log('train/local_transformer_loss', local_transformer_loss, prog_bar=True, sync_dist=True)
+
+            acoustic_codes_predictor_loss = batch_output.acoustic_codes_predictor_loss
+            if acoustic_codes_predictor_loss is not None:
+                self.log('train/acoustic_codes_predictor_loss', acoustic_codes_predictor_loss, sync_dist=True)
+
+            # Log training mode info for multi-mode training
+            if batch_output.selected_training_mode is not None:
+                # Log which mode was selected for this batch
+                # Convert mode name to an index for logging
+                mode_idx = self.mode_name_to_mode[batch_output.selected_training_mode].mode_idx
+                self.log('train/training_mode_idx', float(mode_idx), on_step=True)
+
+            # Log batch info
+            batch_size, text_token_max_len = batch["text"].shape
+            text_token_total_num = batch["text_lens"].sum()
+            batch_info_dict = {
+                "train/batch_size": batch_size,
+                "train/text_token_max_len": text_token_max_len,
+                "train/text_token_total_num_in_batch": text_token_total_num,
+                "train/text_token_pad_ratio_percent_in_batch": 100
+                * (1 - text_token_total_num / (batch_size * text_token_max_len)),
+            }
+
+            if "audio_codes" in batch:
+                audio_codes_max_len = batch["audio_codes"].shape[-1]
+                audio_codes_total_num = batch["audio_codes_lens"].sum()
+                batch_info_dict.update(
+                    {
+                        "train/audio_codes_max_len": audio_codes_max_len,
+                        "train/audio_codes_total_num_in_batch": audio_codes_total_num,
+                        "train/audio_codes_pad_ratio_percent_in_batch": 100
+                        * (1 - audio_codes_total_num / (batch_size * audio_codes_max_len)),
+                    }
+                )
+            else:
+                audio_samples_max_len = batch["audio"].shape[-1]
+                audio_samples_total_num = batch["audio_lens"].sum()
+                batch_info_dict.update(
+                    {
+                        "train/audio_samples_max_len": audio_samples_max_len,
+                        "train/audio_samples_total_num_in_batch": audio_samples_total_num,
+                        "train/audio_samples_pad_ratio_percent_in_batch": 100
+                        * (1 - audio_samples_total_num / (batch_size * audio_samples_max_len)),
+                    }
+                )
+
+            self.log_dict(batch_info_dict, on_step=True)
 
         return loss
+
+    def configure_gradient_clipping(self, optimizer, gradient_clip_val=None, gradient_clip_algorithm=None):
+        with self._tts_profile.range('gradient_clipping'):
+            return super().configure_gradient_clipping(optimizer, gradient_clip_val, gradient_clip_algorithm)
 
     def validation_step(self, batch, batch_idx):
         # Extract inputs from batch and pass explicitly to process_batch
