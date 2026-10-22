@@ -49,6 +49,13 @@ from nemo.collections.tts.modules.magpietts_modules import (
     SpecialAudioToken,
     add_special_tokens,
 )
+from nemo.collections.tts.parts.utils.codebook_sampling import (
+    filter_top_p,
+    resolve_codebook_cfg_scale,
+    resolve_codebook_temperature,
+    resolve_codebook_topk,
+    validate_top_p,
+)
 from nemo.collections.tts.parts.utils.helpers import get_mask_from_lengths
 from nemo.collections.tts.parts.utils.tts_dataset_utils import tokenize_text_with_phoneme_spans
 from nemo.core.classes import ModelPT
@@ -98,6 +105,7 @@ class StreamingConfig:
         use_local_transformer: Whether to use local transformer for inference.
         temperature: Sampling temperature.
         topk: Top-k sampling parameter.
+        top_p: Audio nucleus threshold; 1 disables it.
         phoneme_temperature: Sampling temperature for predicted phonemes.
         phoneme_topk: Top-k sampling parameter for predicted phonemes.
         phoneme_input_type: 'gt' or 'pred' for phoneme tokens.
@@ -118,6 +126,10 @@ class StreamingConfig:
     dummy_context_embedding_unconditional: Optional[torch.Tensor]
     phoneme_temperature: Optional[float] = None
     phoneme_topk: Optional[int] = None
+    audio_channel_topk: Optional[Tuple[int, ...]] = None
+    audio_channel_temperature: Optional[Tuple[float, ...]] = None
+    audio_channel_cfg_scale: Optional[Tuple[float, ...]] = None
+    top_p: float = 1.0
 
 
 @dataclass
@@ -204,6 +216,10 @@ class EasyModelInferenceParameters:
         max_decoder_steps: Maximum number of decoder steps.
         temperature: Sampling temperature.
         topk: Number of top-probability tokens to consider in sampling.
+        top_p: Audio nucleus probability threshold after temperature/top-k; 1 disables it.
+        codebook_topk: One-based audio-codebook overrides, applied to every stacked frame.
+        codebook_temperature: One-based audio temperature overrides at every stacked frame.
+        codebook_cfg_scale: One-based audio CFG overrides at every stacked frame; requires CFG.
         cfg_scale: Scale factor for classifier-free guidance.
     """
 
@@ -211,6 +227,16 @@ class EasyModelInferenceParameters:
     temperature: float = 0.7
     topk: int = 80
     cfg_scale: float = 2.5
+    # One-based codebook numbers; applies to every stacked frame, not phonemes.
+    codebook_topk: Optional[Dict[int, int]] = None
+    codebook_temperature: Optional[Dict[int, float]] = None
+    codebook_cfg_scale: Optional[Dict[int, float]] = None
+    top_p: float = 1.0
+
+    def __post_init__(self):
+        validate_top_p(self.top_p)
+        if isinstance(self.topk, bool) or not isinstance(self.topk, int) or self.topk < 0:
+            raise ValueError('topk must be a non-negative integer (0 disables top-k)')
 
     @classmethod
     def from_dict(cls, data: dict) -> 'EasyModelInferenceParameters':
@@ -1321,7 +1347,15 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         return all_preds
 
     def sample_codes_from_logits(
-        self, all_code_logits_t, temperature=0.7, topk=80, unfinished_items={}, finished_items={}
+        self,
+        all_code_logits_t,
+        temperature=0.7,
+        topk=80,
+        unfinished_items={},
+        finished_items={},
+        channel_topk=None,
+        channel_temperature=None,
+        top_p=1.0,
     ):
         # all_code_logits_t: (B, num_codebooks * num_tokens_per_codebook), logits at a given timestep
         """Sample one token per audio-code channel from filtered logits.
@@ -1330,12 +1364,17 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             all_code_logits_t: Per-step logits shaped ``(B, C * V)``.
             temperature: Sampling temperature; non-positive values use argmax.
             topk: Number of highest-logit candidates retained per channel.
+            top_p: Nucleus threshold after temperature and top-k; 1 disables it.
+            channel_topk: Optional resolved per-channel top-k in codebook-major order.
             unfinished_items: Batch indices for which EOS must be suppressed.
             finished_items: Batch indices forced to emit EOS.
 
         Returns:
             Sampled stacked audio-code tokens shaped ``(B, C)``.
         """
+        validate_top_p(top_p)
+        if isinstance(topk, bool) or not isinstance(topk, int) or topk < 0:
+            raise ValueError('topk must be a non-negative integer (0 disables top-k)')
         all_preds = []
         for idx in range(self.num_audio_codebooks * self.frame_stacking_factor):
             si = idx * self.num_all_tokens_per_codebook
@@ -1349,19 +1388,24 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             for item_idx in finished_items:
                 codebook_logits[item_idx, :] = float('-inf')
                 codebook_logits[item_idx, self.audio_eos_id] = 0.0
-            codebook_logits_topk = torch.topk(codebook_logits, topk, dim=-1)[0]  # (B, topk)
-            indices_to_remove = codebook_logits < codebook_logits_topk[:, -1].unsqueeze(
-                -1
-            )  # (B, num_tokens_per_codebook)
+            channel_k = topk if channel_topk is None else channel_topk[idx]
             codebook_logits_rescored = codebook_logits.clone()
-            codebook_logits_rescored[indices_to_remove] = float('-inf')
+            if channel_k:
+                codebook_logits_topk, candidate_indices = torch.topk(codebook_logits, channel_k, dim=-1)
+                indices_to_remove = codebook_logits < codebook_logits_topk[:, -1].unsqueeze(-1)
+                codebook_logits_rescored[indices_to_remove] = float('-inf')
+                if channel_topk is not None and channel_k != topk:
+                    # Exact k candidates even for tied logits; leave the legacy baseline path unchanged.
+                    codebook_logits_rescored.fill_(float('-inf'))
+                    codebook_logits_rescored.scatter_(1, candidate_indices, codebook_logits_topk)
 
-            if temperature <= 0.0:
+            channel_temp = temperature if channel_temperature is None else channel_temperature[idx]
+            if channel_temp <= 0.0:
                 # Argmax sampling for deterministic output
                 codebook_preds = codebook_logits_rescored.argmax(dim=-1, keepdim=True)  # (B, 1)
             else:
                 codebook_probs = torch.softmax(
-                    codebook_logits_rescored / temperature, dim=-1
+                    filter_top_p(codebook_logits_rescored / channel_temp, top_p), dim=-1
                 )  # (B, num_tokens_per_codebook)
                 codebook_preds = torch.multinomial(codebook_probs, 1)  # (B, 1)
             all_preds.append(codebook_preds)
@@ -1388,7 +1432,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             # Replace NaN/inf then clamp to prevent extreme values causing NaN in softmax
             codebook_logits = torch.nan_to_num(codebook_logits, nan=0.0, posinf=100.0, neginf=-100.0)
             codebook_logits = codebook_logits.clamp(min=-100.0, max=100.0)
-            if topk < self.phoneme_vocab_size:
+            if 0 < topk < self.phoneme_vocab_size:
                 codebook_logits_topk = torch.topk(codebook_logits, topk, dim=-1)[0]  # (B, topk)
                 indices_to_remove = codebook_logits < codebook_logits_topk[:, -1].unsqueeze(
                     -1
@@ -1702,6 +1746,9 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         use_local_transformer_for_inference: bool,
         use_cfg: bool,
         cfg_scale: float,
+        audio_channel_topk: Optional[Tuple[int, ...]] = None,
+        audio_channel_temperature: Optional[Tuple[float, ...]] = None,
+        top_p: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Sample audio codes from logits using either local transformer or parallel sampling.
@@ -1732,9 +1779,18 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             all_codes_next_argmax = audio_codes_next
         else:
             # Parallel sampling from all codebook logits
-            audio_codes_next = self.sample_codes_from_logits(all_code_logits_t, temperature=temperature, topk=topk)
+            audio_codes_next = self.sample_codes_from_logits(
+                all_code_logits_t,
+                temperature=temperature,
+                topk=topk,
+                channel_topk=audio_channel_topk,
+                channel_temperature=audio_channel_temperature,
+                top_p=top_p,
+            )
             # Argmax sampling for reliable EOS detection
-            if temperature <= 0.0:
+            if temperature <= 0.0 and (
+                audio_channel_temperature is None or all(value <= 0 for value in audio_channel_temperature)
+            ):
                 all_codes_next_argmax = audio_codes_next  # already argmax
             else:
                 all_codes_next_argmax = self.sample_codes_from_logits(all_code_logits_t, temperature=0.01)
@@ -1762,6 +1818,10 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         use_inference_mode: bool = True,
         phoneme_temperature: Optional[float] = None,
         phoneme_topk: Optional[int] = None,
+        codebook_topk: Optional[Dict[int, int]] = None,
+        codebook_temperature: Optional[Dict[int, float]] = None,
+        codebook_cfg_scale: Optional[Dict[int, float]] = None,
+        top_p: float = 1.0,
     ) -> StreamingState:
         """
         Initialize streaming TTS inference state.
@@ -1796,6 +1856,10 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             use_local_transformer: Whether to use local transformer for AR sampling.
             temperature: Sampling temperature for audio codes.
             topk: Top-k sampling parameter.
+            top_p: Audio nucleus threshold after temperature/top-k; 1 disables it. Use topk=0 for top-p alone.
+            codebook_topk: One-based codebook-to-top-k mapping, applied at every stacked-frame position.
+            codebook_temperature: One-based audio temperature overrides, applied to every stacked frame.
+            codebook_cfg_scale: One-based audio CFG scale overrides; phoneme CFG is unchanged.
             phoneme_temperature: Sampling temperature for predicted phonemes. Defaults to ``temperature``.
             phoneme_topk: Top-k sampling parameter for predicted phonemes. Defaults to ``topk``.
             phoneme_input_type: 'gt' or 'predicted' for phoneme tokens (use 'predicted' for streaming).
@@ -1809,6 +1873,41 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         Returns:
             StreamingState: Initial state for streaming inference.
         """
+        validate_top_p(top_p)
+        if isinstance(topk, bool) or not isinstance(topk, int) or topk < 0:
+            raise ValueError('topk must be a non-negative integer (0 disables top-k)')
+        if use_local_transformer and (top_p != 1.0 or topk == 0):
+            raise ValueError('top-p and disabled top-k are not supported with local transformer inference')
+        audio_channel_topk = resolve_codebook_topk(
+            topk,
+            codebook_topk,
+            self.num_audio_codebooks,
+            self.frame_stacking_factor,
+            (
+                self.acoustic_codes_predictor.num_output_tokens
+                if self.acoustic_codes_predictor_enabled
+                else self.num_all_tokens_per_codebook
+            ),
+        )
+        audio_channel_temperature = resolve_codebook_temperature(
+            temperature, codebook_temperature, self.num_audio_codebooks, self.frame_stacking_factor
+        )
+        audio_channel_cfg_scale = resolve_codebook_cfg_scale(
+            cfg_scale, codebook_cfg_scale, self.num_audio_codebooks, self.frame_stacking_factor
+        )
+        if audio_channel_cfg_scale is not None and not use_cfg:
+            raise ValueError('codebook_cfg_scale requires use_cfg=True')
+        if any(
+            value is not None for value in (audio_channel_topk, audio_channel_temperature, audio_channel_cfg_scale)
+        ):
+            if use_local_transformer:
+                raise ValueError('Per-codebook sampling overrides are not supported with local transformer inference')
+        if audio_channel_topk is not None:
+            logging.info(f'Audio top-k by stacked channel (codebook-major): {audio_channel_topk}')
+        if audio_channel_temperature is not None:
+            logging.info(f'Audio temperature by stacked channel (codebook-major): {audio_channel_temperature}')
+        if audio_channel_cfg_scale is not None:
+            logging.info(f'Audio CFG scale by stacked channel (codebook-major): {audio_channel_cfg_scale}')
         grad_ctx = torch.inference_mode if use_inference_mode else torch.no_grad
         with grad_ctx():
             batch_size = context_audio_codes.size(0)
@@ -1907,6 +2006,10 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                 use_local_transformer=use_local_transformer,
                 temperature=temperature,
                 topk=topk,
+                audio_channel_topk=audio_channel_topk,
+                audio_channel_temperature=audio_channel_temperature,
+                audio_channel_cfg_scale=audio_channel_cfg_scale,
+                top_p=top_p,
                 phoneme_temperature=temperature if phoneme_temperature is None else phoneme_temperature,
                 phoneme_topk=topk if phoneme_topk is None else phoneme_topk,
                 phoneme_input_type=phoneme_input_type,
@@ -2506,6 +2609,10 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                 cfg_scale=state.config.cfg_scale,
                 sanitize_logits=True,
                 predict=needs_audio,
+                channel_topk=state.config.audio_channel_topk,
+                channel_temperature=state.config.audio_channel_temperature,
+                channel_cfg_scale=state.config.audio_channel_cfg_scale,
+                top_p=state.config.top_p,
             )
             audio_codes_next = audio_codes_next.squeeze(1)
             # TODO @rfejgin: should we add argmax sampling for EOS here too?
@@ -2519,9 +2626,11 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         if state.config.use_cfg:
             conditional_logits = all_code_logits_t[:actual_batch_size]
             unconditional_logits = all_code_logits_t[actual_batch_size:]
-            all_code_logits_t = (
-                state.config.cfg_scale * conditional_logits + (1.0 - state.config.cfg_scale) * unconditional_logits
-            )
+            scale = state.config.cfg_scale
+            if state.config.audio_channel_cfg_scale is not None:
+                scale = all_code_logits_t.new_tensor(state.config.audio_channel_cfg_scale)
+                scale = scale.repeat_interleave(self.num_all_tokens_per_codebook).unsqueeze(0)
+            all_code_logits_t = scale * conditional_logits + (1.0 - scale) * unconditional_logits
 
         # Sample audio codes
         audio_codes_next, all_codes_next_argmax = self._sample_audio_codes(
@@ -2532,6 +2641,9 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             use_local_transformer_for_inference=state.config.use_local_transformer,
             use_cfg=state.config.use_cfg,
             cfg_scale=state.config.cfg_scale,
+            audio_channel_topk=state.config.audio_channel_topk,
+            audio_channel_temperature=state.config.audio_channel_temperature,
+            top_p=state.config.top_p,
         )
 
         return audio_codes_next, all_codes_next_argmax
@@ -2667,6 +2779,10 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         use_inference_mode: bool = True,
         phoneme_temperature: Optional[float] = None,
         phoneme_topk: Optional[int] = None,
+        codebook_topk: Optional[Dict[int, int]] = None,
+        codebook_temperature: Optional[Dict[int, float]] = None,
+        codebook_cfg_scale: Optional[Dict[int, float]] = None,
+        top_p: float = 1.0,
     ) -> InferBatchOutput:
         """
         Batch inference using streaming infrastructure.
@@ -2788,6 +2904,10 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                 topk=topk,
                 phoneme_temperature=phoneme_temperature,
                 phoneme_topk=phoneme_topk,
+                codebook_topk=codebook_topk,
+                codebook_temperature=codebook_temperature,
+                codebook_cfg_scale=codebook_cfg_scale,
+                top_p=top_p,
                 phoneme_input_type=phoneme_input_type,
                 phoneme_sampling_method=phoneme_sampling_method,
                 gt_phoneme_tokens=gt_phoneme_tokens,
@@ -2932,6 +3052,10 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         topk: int = 80,
         max_steps: int = 330,
         gt_phoneme_text: Optional[str] = None,
+        codebook_topk: Optional[Dict[int, int]] = None,
+        codebook_temperature: Optional[Dict[int, float]] = None,
+        codebook_cfg_scale: Optional[Dict[int, float]] = None,
+        top_p: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Generate speech from transcript using EasyMagpie inference with optional context text/audio.
@@ -3031,6 +3155,10 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                 max_decoder_steps=max_steps,
                 temperature=temperature,
                 topk=topk,
+                codebook_topk=codebook_topk,
+                codebook_temperature=codebook_temperature,
+                codebook_cfg_scale=codebook_cfg_scale,
+                top_p=top_p,
                 use_cfg=use_cfg,
                 cfg_scale=cfg_scale,
                 use_local_transformer_for_inference=use_local_transformer,

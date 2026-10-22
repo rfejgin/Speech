@@ -116,6 +116,7 @@ def run_inference_and_evaluation(
     clean_up_disk: bool = False,
     skip_evaluation: bool = False,
     ignore_manifest_language: bool = False,
+    save_predicted_codes: bool = False,
 ) -> Tuple[Optional[float], Optional[float]]:
     """Run inference and optional evaluation on specified datasets.
 
@@ -138,6 +139,7 @@ def run_inference_and_evaluation(
         clean_up_disk: Whether to clean up output directory after completion.
         skip_evaluation: Whether to skip evaluation (inference only mode).
         ignore_manifest_language: Whether dataset-level language should override manifest records.
+        save_predicted_codes: Retain code tensors after scoring for codec-only replay.
 
     Returns:
         Tuple of (mean CER across datasets, mean SSIM across datasets).
@@ -251,14 +253,14 @@ def run_inference_and_evaluation(
             if is_distributed and is_multiturn_user_audio:
                 inference_output_dir = os.path.join(repeat_audio_dir, f"rank_{rank:04d}")
 
-            rtf_metrics_list, _, codec_file_paths = runner.run_inference_on_dataset(
+            rtf_metrics_list, generated_audio_paths, codec_file_paths = runner.run_inference_on_dataset(
                 dataset=test_dataset,
                 output_dir=inference_output_dir,
                 manifest_records=manifest_records,
                 audio_base_dir=meta['audio_dir'],
                 save_cross_attention_maps=True,
                 save_context_audio=(repeat_idx == 0),  # Only save context audio once
-                save_predicted_codes=eval_config.with_fcd,  # Code files are only needed for FCD computation
+                save_predicted_codes=(eval_config.with_fcd or save_predicted_codes),
             )
 
             # Compute mean RTF metrics
@@ -277,6 +279,20 @@ def run_inference_and_evaluation(
                 json.dump(mean_rtf, f, indent=4)
 
             if skip_evaluation:
+                if not is_multiturn_user_audio:
+                    if len(generated_audio_paths) != len(manifest_records):
+                        raise ValueError('Generated audio count does not match the listening manifest')
+                    listening_samples = [
+                        {
+                            'gt_audio_filepath': os.path.join(meta['audio_dir'], row['audio_filepath']),
+                            'context_audio_filepath': os.path.join(meta['audio_dir'], row['context_audio_filepath']),
+                            'pred_audio_filepath': audio_path,
+                            'gt_text': row.get('text', ''),
+                        }
+                        for row, audio_path in zip(manifest_records, generated_audio_paths)
+                    ]
+                    with open(os.path.join(eval_dir, f'{dataset}_samples_{repeat_idx}.json'), 'w') as stream:
+                        json.dump(listening_samples, stream, indent=2)
                 logging.info("Skipping evaluation as requested.")
                 continue
 
@@ -290,7 +306,7 @@ def run_inference_and_evaluation(
                 merged_manifest_path = _merge_multiturn_rank_outputs(
                     repeat_audio_dir=repeat_audio_dir,
                     world_size=world_size,
-                    save_predicted_codes=eval_config.with_fcd,
+                    save_predicted_codes=(eval_config.with_fcd or save_predicted_codes),
                 )
                 eval_manifest_path = merged_manifest_path
                 eval_audio_dir = repeat_audio_dir
@@ -355,7 +371,9 @@ def run_inference_and_evaluation(
             create_violin_plot(filewise_metrics, violin_plot_metrics, violin_path)
 
             # Delete temporary predicted codes files
-            if is_distributed and is_multiturn_user_audio:
+            if save_predicted_codes:
+                logging.info("Retaining predicted codes for codec-only replay.")
+            elif is_distributed and is_multiturn_user_audio:
                 for codec_file_path in Path(repeat_audio_dir).glob("predicted_codes_*.pt"):
                     if os.path.exists(codec_file_path):
                         os.remove(codec_file_path)
@@ -424,6 +442,8 @@ def main(argv=None):
     """Entry point for TTS inference and evaluation."""
     parser = create_argument_parser()
     args = parser.parse_args(argv)
+    if args.save_predicted_codes and args.clean_up_disk:
+        parser.error("--save_predicted_codes cannot be combined with --clean_up_disk")
     if args.model_type == 'easy_magpie' and args.easy_magpie_inference_mode == 'multiturn_user_audio':
         _configure_cuda_for_rank()
         if args.batch_size > 1:
@@ -431,6 +451,8 @@ def main(argv=None):
 
     if args.deterministic:
         seed_all(seed=9)
+    elif args.seed is not None:
+        seed_all(seed=args.seed, deterministic=False)
 
     dataset_meta_info = load_evalset_config(
         config_path=args.datasets_json_path, dataset_base_path=args.datasets_base_path
@@ -526,6 +548,7 @@ def main(argv=None):
                 clean_up_disk=args.clean_up_disk,
                 skip_evaluation=not args.run_evaluation,
                 ignore_manifest_language=args.ignore_manifest_language,
+                save_predicted_codes=args.save_predicted_codes,
             )
 
     else:  # nemo mode
@@ -566,6 +589,7 @@ def main(argv=None):
                 clean_up_disk=args.clean_up_disk,
                 skip_evaluation=not args.run_evaluation,
                 ignore_manifest_language=args.ignore_manifest_language,
+                save_predicted_codes=args.save_predicted_codes,
             )
 
     # Check quality targets

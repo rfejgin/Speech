@@ -1144,6 +1144,7 @@ def _add_inference_param_fields(
 
 def _add_common_args(parser: argparse.ArgumentParser) -> None:
     """Add arguments shared by all model types."""
+    parser.add_argument('--seed', type=int, default=None, help='Seed sampling without forcing deterministic kernels')
 
     parser.add_argument(
         '--model_type',
@@ -1236,6 +1237,11 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     data_group.add_argument('--out_dir', type=str, required=True, help='Output directory')
     data_group.add_argument('--log_exp_name', action='store_true')
     data_group.add_argument('--clean_up_disk', action='store_true')
+    data_group.add_argument(
+        '--save_predicted_codes',
+        action='store_true',
+        help='Retain generated code tensors after evaluation for codec-only replay.',
+    )
 
     # Common inference parameters
     infer_group = parser.add_argument_group('Common Inference Parameters')
@@ -1306,15 +1312,16 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     target_group.add_argument('--ssim_target', type=float, default=None)
 
 
-def seed_all(seed: int):
+def seed_all(seed: int, deterministic: bool = True):
     """
     Attempts to make script deterministic
     """
     torch.manual_seed(seed)
     random.seed(seed)
     np.random.seed(seed)
-    torch.backends.cudnn.benchmark = False
-    torch.use_deterministic_algorithms(True)
+    if deterministic:
+        torch.backends.cudnn.benchmark = False
+        torch.use_deterministic_algorithms(True)
 
 
 def _add_magpie_args(parser: argparse.ArgumentParser) -> None:
@@ -1338,6 +1345,33 @@ def _add_magpie_args(parser: argparse.ArgumentParser) -> None:
 def _add_easy_magpie_args(parser: argparse.ArgumentParser) -> None:
     """Add arguments specific to decoder-only EasyMagpieTTSInferenceModel."""
     group = parser.add_argument_group('EasyMagpieTTS-specific Parameters')
+    group.add_argument(
+        '--sampling_statistics', action='store_true', help='Save progressive pre-filter probability statistics'
+    )
+    group.add_argument(
+        '--top_p',
+        type=float,
+        default=1.0,
+        help='Audio nucleus threshold in (0, 1], after temperature/top-k; 1 disables it. Use --topk 0 for top-p alone.',
+    )
+    group.add_argument(
+        '--codebook_cfg_scale',
+        type=json.loads,
+        default=None,
+        help='One-based audio-codebook CFG scale overrides as JSON; applies to every stacked frame; requires CFG.',
+    )
+    group.add_argument(
+        '--codebook_temperature',
+        type=json.loads,
+        default=None,
+        help='One-based audio-codebook temperature overrides as JSON; applies to every stacked frame.',
+    )
+    group.add_argument(
+        '--codebook_topk',
+        type=json.loads,
+        default=None,
+        help='JSON mapping of one-based audio codebooks to top-k, e.g. {"7": 1, "8": 1}; all stacked frames.',
+    )
     group.add_argument(
         '--easy_magpie_inference_mode',
         type=str,
@@ -1411,6 +1445,8 @@ def _build_magpie_config(args) -> MagpieInferenceConfig:
 
 
 def _build_easy_magpie_config(args) -> EasyMagpieInferenceConfig:
+    if args.sampling_statistics and args.easy_magpie_inference_mode != 'single_turn':
+        raise ValueError('Sampling statistics currently support single-turn inference only')
     cfg_cls = (
         EasyMagpieMultiturnUserAudioInferenceConfig
         if args.easy_magpie_inference_mode == 'multiturn_user_audio'
@@ -1424,6 +1460,7 @@ def _build_easy_magpie_config(args) -> EasyMagpieInferenceConfig:
         phoneme_input_type=args.phoneme_input_type,
         phoneme_sampling_method=args.phoneme_sampling_method,
         dropout_text_input=args.dropout_text_input,
+        sampling_statistics=args.sampling_statistics,
         default_tokenizer_name=args.tokenizer_name,
     )
     if cfg_cls is EasyMagpieMultiturnUserAudioInferenceConfig:
@@ -1435,6 +1472,8 @@ def _build_easy_magpie_config(args) -> EasyMagpieInferenceConfig:
 
 
 def _select_runner_cls(args):
+    if args.model_type == 'magpie' and (args.top_p != 1.0 or args.topk == 0):
+        raise ValueError('top-p and disabled top-k require --model_type easy_magpie')
     if args.model_type == 'magpie':
         if args.easy_magpie_inference_mode != 'single_turn':
             raise ValueError('--easy_magpie_inference_mode is only supported with --model_type easy_magpie')

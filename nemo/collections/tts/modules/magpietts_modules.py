@@ -32,6 +32,7 @@ from nemo.collections.tts.modules.nemotron_h_decoder import (
     NemotronHConfig,
     NemotronHRMSNorm,
 )
+from nemo.collections.tts.parts.utils.codebook_sampling import filter_top_p, validate_top_p
 from nemo.collections.tts.parts.utils.helpers import get_mask_from_lengths
 from nemo.core.classes.common import safe_instantiate
 from nemo.core.classes.module import NeuralModule
@@ -912,7 +913,12 @@ class AcousticCodesPredictorBlock(torch.nn.Module):
 
 
 class AcousticCodesPredictor(torch.nn.Module):
-    """Predict all acoustic-code channels iteratively from backbone hidden states."""
+    """Predict stacked acoustic-code channels in codebook-major or frame-major order.
+
+    Targets, embeddings, and returned codes always use codebook-major channel indices
+    (``codebook * frame_stacking_factor + frame``). Frame-major prediction requires
+    one channel per block; codebook-major prediction also supports grouped schedules.
+    """
 
     def __init__(
         self,
@@ -924,6 +930,8 @@ class AcousticCodesPredictor(torch.nn.Module):
         codebook_size: int,
         prediction_schedule,
         n_layers: int = 1,
+        prediction_order: str = "codebook_major",
+        frame_stacking_factor: int = 1,
     ):
         super().__init__()
         prediction_schedule = tuple(int(num_codes) for num_codes in prediction_schedule)
@@ -935,6 +943,28 @@ class AcousticCodesPredictor(torch.nn.Module):
             f"acoustic_codes_predictor_schedule predicts {sum(prediction_schedule)} codes, "
             f"expected {num_audio_codebooks}"
         )
+        if prediction_order not in {"codebook_major", "frame_major"}:
+            raise ValueError(f"Unsupported acoustic_codes_predictor_order: {prediction_order!r}")
+        if (
+            isinstance(frame_stacking_factor, bool)
+            or not isinstance(frame_stacking_factor, int)
+            or frame_stacking_factor < 1
+            or num_audio_codebooks % frame_stacking_factor != 0
+        ):
+            raise ValueError("frame_stacking_factor must be a positive integer dividing the stacked channel count")
+        if prediction_order == "frame_major" and any(num_codes != 1 for num_codes in prediction_schedule):
+            raise ValueError(
+                "acoustic_codes_predictor_order='frame_major' requires "
+                "acoustic_codes_predictor_schedule to contain only ones"
+            )
+
+        channel_order = tuple(range(num_audio_codebooks))
+        if prediction_order == "frame_major":
+            channel_order = tuple(
+                codebook * frame_stacking_factor + frame
+                for frame in range(frame_stacking_factor)
+                for codebook in range(num_audio_codebooks // frame_stacking_factor)
+            )
 
         self.embed_codes = embed_codes
         self.num_audio_codebooks = num_audio_codebooks
@@ -943,20 +973,22 @@ class AcousticCodesPredictor(torch.nn.Module):
         self.codebook_size = codebook_size
         self.num_output_tokens = codebook_size + 1
         self.prediction_schedule = prediction_schedule
+        self.prediction_order = prediction_order
 
         blocks = []
-        first_code = 0
+        offset = 0
         for num_codes in prediction_schedule:
             blocks.append(
                 AcousticCodesPredictorBlock(
                     backbone_config=backbone_config,
-                    first_code=first_code,
+                    # Groups remain contiguous: frame-major permits singleton blocks only.
+                    first_code=channel_order[offset],
                     num_codes=num_codes,
                     num_output_tokens=self.num_output_tokens,
                     n_layers=n_layers,
                 )
             )
-            first_code += num_codes
+            offset += num_codes
         self.blocks = torch.nn.ModuleList(blocks)
 
     def make_cache(self, batch_size: int, device, dtype) -> List[HybridMambaAttentionDynamicCache]:
@@ -1069,8 +1101,13 @@ class AcousticCodesPredictor(torch.nn.Module):
         cfg_scale: float = 1.0,
         sanitize_logits: bool = False,
         predict: Optional[torch.Tensor] = None,
+        channel_topk: Optional[tuple[int, ...]] = None,
+        channel_temperature: Optional[tuple[float, ...]] = None,
+        channel_cfg_scale: Optional[tuple[float, ...]] = None,
+        top_p: float = 1.0,
     ) -> torch.Tensor:
         """Sample every acoustic-code channel without using backbone code predictions."""
+        validate_top_p(top_p)
         num_streams = hidden_states.size(0) // 2 if use_cfg else hidden_states.size(0)
         assert not use_cfg or hidden_states.size(0) == 2 * num_streams
         if predict is None:
@@ -1086,6 +1123,9 @@ class AcousticCodesPredictor(torch.nn.Module):
             device=hidden_states.device,
         )
         predicted_rows = predict.view(-1, 1, 1)
+        sampling_observer = getattr(self, 'sampling_observer', None)
+        if sampling_observer is not None:
+            sampling_observer.start_step(predict)
         previous_codes = None
         previous_codebook_indices = None
         for step, block in enumerate(self.blocks):
@@ -1100,12 +1140,31 @@ class AcousticCodesPredictor(torch.nn.Module):
             )
             logits = block.compute_logits(hidden_states)
             if use_cfg:
-                logits = cfg_scale * logits[:num_streams] + (1.0 - cfg_scale) * logits[num_streams:]
+                scale = cfg_scale
+                if channel_cfg_scale is not None:
+                    scale = logits.new_tensor([channel_cfg_scale[i] for i in block.codebook_indices])
+                    scale = scale.view(1, 1, -1, 1)
+                logits = scale * logits[:num_streams] + (1.0 - scale) * logits[num_streams:]
             if sanitize_logits:
                 logits = torch.nan_to_num(logits, nan=0.0, posinf=100.0, neginf=-100.0)
                 logits = logits.clamp(min=-100.0, max=100.0)
 
-            sampled = self._sample_codes(logits, temperature=temperature, topk=topk)
+            block_topk = None if channel_topk is None else tuple(channel_topk[i] for i in block.codebook_indices)
+            block_temperature = (
+                None if channel_temperature is None else tuple(channel_temperature[i] for i in block.codebook_indices)
+            )
+            if sampling_observer is not None:
+                sampling_observer.observe(
+                    logits, block.codebook_indices, temperature, block_temperature, self.codebook_size
+                )
+            sampled = self._sample_codes(
+                logits,
+                temperature=temperature,
+                topk=topk,
+                channel_topk=block_topk,
+                channel_temperature=block_temperature,
+                top_p=top_p,
+            )
             sampled = torch.where(sampled == self.codebook_size, self.audio_eos_id, sampled)
             previous_codes = torch.where(
                 predicted_rows,
@@ -1122,12 +1181,44 @@ class AcousticCodesPredictor(torch.nn.Module):
     def _embed(self, codes: torch.Tensor, codebook_indices) -> torch.Tensor:
         return self.embed_codes(codes.transpose(1, 2), codebook_indices=codebook_indices)
 
-    def _sample_codes(self, logits: torch.Tensor, temperature: float, topk: int) -> torch.Tensor:
-        cutoff = logits.topk(min(topk, self.num_output_tokens), dim=-1).values[..., -1:]
-        logits = logits.masked_fill(logits < cutoff, float('-inf'))
+    def _sample_codes(
+        self,
+        logits: torch.Tensor,
+        temperature: float,
+        topk: int,
+        channel_topk=None,
+        channel_temperature=None,
+        top_p: float = 1.0,
+    ) -> torch.Tensor:
+        validate_top_p(top_p)
+        if isinstance(topk, bool) or not isinstance(topk, int) or topk < 0:
+            raise ValueError('topk must be a non-negative integer (0 disables top-k)')
+        if topk:
+            cutoff = logits.topk(min(topk, self.num_output_tokens), dim=-1).values[..., -1:]
+            filtered = logits.masked_fill(logits < cutoff, float('-inf'))
+        else:
+            filtered = logits.clone()
+        if channel_topk is not None:
+            for channel, k in enumerate(channel_topk):
+                if k != topk:
+                    if k == 0:
+                        filtered[..., channel, :] = logits[..., channel, :]
+                        continue
+                    # Exact k even for tied logits; preserve baseline filtering and RNG batching elsewhere.
+                    candidates = logits[..., channel, :].topk(min(k, self.num_output_tokens), dim=-1)
+                    filtered[..., channel, :].fill_(float('-inf'))
+                    filtered[..., channel, :].scatter_(-1, candidates.indices, candidates.values)
+        logits = filtered
+        if channel_temperature is not None:
+            temperatures = logits.new_tensor(channel_temperature).view(1, 1, -1, 1)
+            # A zero override is greedy; use a safe denominator before selecting its argmax.
+            denominator = torch.where(temperatures > 0, temperatures, torch.ones_like(temperatures))
+            probs = torch.softmax(filter_top_p(logits / denominator, top_p), dim=-1)
+            sampled = torch.multinomial(probs.reshape(-1, self.num_output_tokens), 1).reshape(probs.shape[:-1])
+            return torch.where(temperatures.squeeze(-1) <= 0, logits.argmax(dim=-1), sampled)
         if temperature <= 0.0:
             return logits.argmax(dim=-1)
-        probs = torch.softmax(logits / temperature, dim=-1)
+        probs = torch.softmax(filter_top_p(logits / temperature, top_p), dim=-1)
         return torch.multinomial(probs.reshape(-1, self.num_output_tokens), num_samples=1).reshape(probs.shape[:-1])
 
 

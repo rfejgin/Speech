@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import abc
 import glob
+import hashlib
 import json
 import os
 import shutil
@@ -44,6 +45,7 @@ from nemo.collections.common.tokenizers.text_to_speech.tts_tokenizers import Agg
 from nemo.collections.tts.data.text_to_speech_dataset import ChunkedTTSInferenceDataset, MagpieTTSDataset
 from nemo.collections.tts.models.easy_magpietts_inference import EasyModelInferenceParameters
 from nemo.collections.tts.models.magpietts import ModelInferenceParameters
+from nemo.collections.tts.parts.utils.sampling_statistics import collect_sampling_statistics
 from nemo.collections.tts.parts.utils.tts_dataset_utils import normalize_volume, stack_tensors
 from nemo.utils import logging
 
@@ -157,6 +159,7 @@ class EasyMagpieInferenceConfig(BaseInferenceConfig):
     phoneme_input_type: str = "gt"
     phoneme_sampling_method: str = "argmax"
     dropout_text_input: bool = False
+    sampling_statistics: bool = False
 
     def build_identifier(self) -> str:
         parts = [
@@ -166,6 +169,19 @@ class EasyMagpieInferenceConfig(BaseInferenceConfig):
             f"LT_{self.use_local_transformer}",
             f"Phoneme_{self.phoneme_input_type}_{self.phoneme_sampling_method}",
         ]
+        if self.model_inference_parameters.codebook_topk:
+            overrides = self.model_inference_parameters.codebook_topk
+            parts.append('CodebookTopk_' + '-'.join(f'{key}x{overrides[key]}' for key in sorted(overrides, key=int)))
+        if self.model_inference_parameters.top_p != 1.0:
+            parts.append(f'Topp{self.model_inference_parameters.top_p}')
+        if self.model_inference_parameters.codebook_temperature:
+            overrides = self.model_inference_parameters.codebook_temperature
+            canonical = json.dumps({int(k): v for k, v in overrides.items()}, sort_keys=True)
+            parts.append('CbTemp' + hashlib.sha256(canonical.encode()).hexdigest()[:10])
+        if self.model_inference_parameters.codebook_cfg_scale:
+            overrides = self.model_inference_parameters.codebook_cfg_scale
+            canonical = json.dumps({int(k): v for k, v in overrides.items()}, sort_keys=True)
+            parts.append('CbCfg' + hashlib.sha256(canonical.encode()).hexdigest()[:10])
         return "_".join(parts)
 
 
@@ -980,18 +996,28 @@ class EasyMagpieInferenceRunner(BaseInferenceRunner):
         for batch_idx, batch in enumerate(dataloader):
             logging.info(f"Processing batch {batch_idx + 1}/{len(dataloader)}")
             batch = self._batch_to_cuda(batch)
-            output = self.model.infer_batch(
-                batch,
-                max_decoder_steps=self.config.model_inference_parameters.max_decoder_steps,
-                temperature=self.config.model_inference_parameters.temperature,
-                topk=self.config.model_inference_parameters.topk,
-                use_cfg=self.config.use_cfg,
-                cfg_scale=self.config.model_inference_parameters.cfg_scale,
-                use_local_transformer_for_inference=self.config.use_local_transformer,
-                phoneme_input_type=self.config.phoneme_input_type,
-                phoneme_sampling_method=phoneme_sampling_method,
-                force_dropout_text=self.config.dropout_text_input,
-            )
+            with collect_sampling_statistics(self.model, self.config.sampling_statistics) as statistics:
+                output = self.model.infer_batch(
+                    batch,
+                    max_decoder_steps=self.config.model_inference_parameters.max_decoder_steps,
+                    temperature=self.config.model_inference_parameters.temperature,
+                    topk=self.config.model_inference_parameters.topk,
+                    codebook_topk=self.config.model_inference_parameters.codebook_topk,
+                    top_p=self.config.model_inference_parameters.top_p,
+                    codebook_temperature=self.config.model_inference_parameters.codebook_temperature,
+                    codebook_cfg_scale=self.config.model_inference_parameters.codebook_cfg_scale,
+                    use_cfg=self.config.use_cfg,
+                    cfg_scale=self.config.model_inference_parameters.cfg_scale,
+                    use_local_transformer_for_inference=self.config.use_local_transformer,
+                    phoneme_input_type=self.config.phoneme_input_type,
+                    phoneme_sampling_method=phoneme_sampling_method,
+                    force_dropout_text=self.config.dropout_text_input,
+                )
+            if statistics is not None:
+                path = statistics.write(
+                    output, output_dir, batch_idx, item_idx, manifest_records, self.model.output_sample_rate
+                )
+                logging.info(f'Wrote sampling statistics: {path}')
             predicted_audio = output.predicted_audio
             predicted_audio_lens = output.predicted_audio_lens
             predicted_codes = output.predicted_codes
@@ -1257,6 +1283,10 @@ class EasyMagpieMultiturnUserAudioInferenceRunner(BaseInferenceRunner):
                 use_local_transformer=self.config.use_local_transformer,
                 temperature=params.temperature,
                 topk=params.topk,
+                codebook_topk=params.codebook_topk,
+                top_p=params.top_p,
+                codebook_temperature=params.codebook_temperature,
+                codebook_cfg_scale=params.codebook_cfg_scale,
                 phoneme_input_type="pred",
                 phoneme_sampling_method=self.config.phoneme_sampling_method,
                 use_inference_mode=True,
