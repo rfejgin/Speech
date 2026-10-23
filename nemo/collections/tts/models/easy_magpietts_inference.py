@@ -726,6 +726,8 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                 codebook_size=self.codebook_size,
                 prediction_schedule=prediction_schedule,
                 n_layers=cfg.get('acoustic_codes_predictor_n_layers', 1),
+                prediction_order=cfg.get('acoustic_codes_predictor_order', 'codebook_major'),
+                frame_stacking_factor=self.frame_stacking_factor,
             )
 
     @property

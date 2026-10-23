@@ -725,14 +725,18 @@ def test_acoustic_codes_predictor_requires_no_local_transformer():
 
 
 @pytest.mark.parametrize("use_codec_latent_audio_embedding", [False, True], ids=["embedding_tables", "codec_latents"])
-def test_acoustic_codes_predictor_process_batch_with_frame_stacking(use_codec_latent_audio_embedding):
+@pytest.mark.parametrize("prediction_order", ["codebook_major", "frame_major"])
+def test_acoustic_codes_predictor_process_batch_with_frame_stacking(
+    use_codec_latent_audio_embedding, prediction_order
+):
     model = _make_easy_magpie_model(
         tiny_easy_magpie_cfg(
             {
                 "use_codec_latent_audio_embedding": use_codec_latent_audio_embedding,
                 "frame_stacking_factor": 2,
                 "acoustic_codes_predictor": True,
-                "acoustic_codes_predictor_schedule": [4, 12],
+                "acoustic_codes_predictor_schedule": [4, 12] if prediction_order == "codebook_major" else [1] * 16,
+                "acoustic_codes_predictor_order": prediction_order,
                 "use_user_speaking_token": True,
                 "feature_masking": {
                     "_target_": "nemo.collections.tts.modules.magpietts_modules.FeatureMasking",
@@ -766,10 +770,27 @@ def test_acoustic_codes_predictor_process_batch_with_frame_stacking(use_codec_la
 
     assert model.local_transformer_type == LocalTransformerType.NO_LT
     assert model.acoustic_codes_predictor.num_audio_codebooks == 2 * model.num_audio_codebooks
+    expected_order = (
+        list(range(16)) if prediction_order == "codebook_major" else list(range(0, 16, 2)) + list(range(1, 16, 2))
+    )
+    assert [i for block in model.acoustic_codes_predictor.blocks for i in block.codebook_indices] == expected_order
     assert predicted.shape == (2, 1, 2 * model.num_audio_codebooks)
     assert output.audio_codes_target.size(1) == 2 * model.num_audio_codebooks
     assert torch.isfinite(output.acoustic_codes_predictor_loss)
     assert torch.isfinite(output.loss)
+
+
+def test_acoustic_codes_predictor_frame_major_rejects_grouped_schedule_from_model_config():
+    cfg = tiny_easy_magpie_cfg(
+        {
+            "acoustic_codes_predictor": True,
+            "frame_stacking_factor": 2,
+            "acoustic_codes_predictor_order": "frame_major",
+            "acoustic_codes_predictor_schedule": [4, 12],
+        }
+    )
+    with pytest.raises(ValueError, match="requires .* to contain only ones"):
+        _make_easy_magpie_model(cfg)
 
 
 def test_acoustic_codes_predictor_loss_mask_uses_audio_delay():
@@ -781,6 +802,7 @@ def test_acoustic_codes_predictor_loss_mask_uses_audio_delay():
             }
         )
     )
+    assert model.acoustic_codes_predictor.prediction_order == "codebook_major"
     audio_codes_target = _toy_codes(model, batch_size=2, num_frames=4)
     audio_codes_lens_target = torch.tensor([4, 3])
     audio_delay = torch.tensor([2, 1])

@@ -990,6 +990,11 @@ class AcousticCodesPredictor(torch.nn.Module):
             )
             offset += num_codes
         self.blocks = torch.nn.ModuleList(blocks)
+        logging.info(
+            f"Acoustic codes predictor: order={self.prediction_order}, "
+            f"frame_stacking_factor={frame_stacking_factor}, "
+            f"channel_order={list(channel_order)}, schedule={list(self.prediction_schedule)}"
+        )
 
     def make_cache(self, batch_size: int, device, dtype) -> List[HybridMambaAttentionDynamicCache]:
         return [block.make_cache(batch_size, device=device, dtype=dtype) for block in self.blocks]
