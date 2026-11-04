@@ -912,7 +912,12 @@ class AcousticCodesPredictorBlock(torch.nn.Module):
 
 
 class AcousticCodesPredictor(torch.nn.Module):
-    """Predict all acoustic-code channels iteratively from backbone hidden states."""
+    """Predict stacked acoustic-code channels in codebook-major or frame-major order.
+
+    Targets, embeddings, and returned codes always use codebook-major channel indices
+    (``codebook * frame_stacking_factor + frame``). Frame-major prediction requires
+    one channel per block; codebook-major prediction also supports grouped schedules.
+    """
 
     def __init__(
         self,
@@ -924,6 +929,8 @@ class AcousticCodesPredictor(torch.nn.Module):
         codebook_size: int,
         prediction_schedule,
         n_layers: int = 1,
+        prediction_order: str = "codebook_major",
+        frame_stacking_factor: int = 1,
     ):
         super().__init__()
         prediction_schedule = tuple(int(num_codes) for num_codes in prediction_schedule)
@@ -935,6 +942,28 @@ class AcousticCodesPredictor(torch.nn.Module):
             f"acoustic_codes_predictor_schedule predicts {sum(prediction_schedule)} codes, "
             f"expected {num_audio_codebooks}"
         )
+        if prediction_order not in {"codebook_major", "frame_major"}:
+            raise ValueError(f"Unsupported acoustic_codes_predictor_order: {prediction_order!r}")
+        if (
+            isinstance(frame_stacking_factor, bool)
+            or not isinstance(frame_stacking_factor, int)
+            or frame_stacking_factor < 1
+            or num_audio_codebooks % frame_stacking_factor != 0
+        ):
+            raise ValueError("frame_stacking_factor must be a positive integer dividing the stacked channel count")
+        if prediction_order == "frame_major" and any(num_codes != 1 for num_codes in prediction_schedule):
+            raise ValueError(
+                "acoustic_codes_predictor_order='frame_major' requires "
+                "acoustic_codes_predictor_schedule to contain only ones"
+            )
+
+        channel_order = tuple(range(num_audio_codebooks))
+        if prediction_order == "frame_major":
+            channel_order = tuple(
+                codebook * frame_stacking_factor + frame
+                for frame in range(frame_stacking_factor)
+                for codebook in range(num_audio_codebooks // frame_stacking_factor)
+            )
 
         self.embed_codes = embed_codes
         self.num_audio_codebooks = num_audio_codebooks
@@ -943,21 +972,28 @@ class AcousticCodesPredictor(torch.nn.Module):
         self.codebook_size = codebook_size
         self.num_output_tokens = codebook_size + 1
         self.prediction_schedule = prediction_schedule
+        self.prediction_order = prediction_order
 
         blocks = []
-        first_code = 0
+        offset = 0
         for num_codes in prediction_schedule:
             blocks.append(
                 AcousticCodesPredictorBlock(
                     backbone_config=backbone_config,
-                    first_code=first_code,
+                    # Groups remain contiguous: frame-major permits singleton blocks only.
+                    first_code=channel_order[offset],
                     num_codes=num_codes,
                     num_output_tokens=self.num_output_tokens,
                     n_layers=n_layers,
                 )
             )
-            first_code += num_codes
+            offset += num_codes
         self.blocks = torch.nn.ModuleList(blocks)
+        logging.info(
+            f"Acoustic codes predictor: order={self.prediction_order}, "
+            f"frame_stacking_factor={frame_stacking_factor}, "
+            f"channel_order={list(channel_order)}, schedule={list(self.prediction_schedule)}"
+        )
 
     def make_cache(self, batch_size: int, device, dtype) -> List[HybridMambaAttentionDynamicCache]:
         return [block.make_cache(batch_size, device=device, dtype=dtype) for block in self.blocks]

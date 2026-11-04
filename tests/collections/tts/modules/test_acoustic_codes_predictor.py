@@ -117,6 +117,83 @@ def test_schedule_must_cover_every_code_channel():
         _make_predictor(prediction_schedule=(2, 5))
 
 
+@pytest.mark.parametrize("schedule", [SCHEDULE, (1,) * NUM_CODES])
+def test_default_order_preserves_codebook_major_checkpoints_and_predictions(schedule):
+    legacy = _make_predictor(prediction_schedule=schedule)
+    explicit = _make_predictor(
+        prediction_schedule=schedule, prediction_order="codebook_major", frame_stacking_factor=2
+    )
+    explicit.load_state_dict(legacy.state_dict(), strict=True)
+    assert legacy.prediction_order == "codebook_major"
+    assert [index for block in explicit.blocks for index in block.codebook_indices] == list(range(NUM_CODES))
+    hidden_states = torch.randn(2, 3, D_MODEL)
+    targets = torch.randint(0, CODEBOOK_SIZE, (2, 3, NUM_CODES))
+    lengths = torch.tensor([3, 2])
+    torch.testing.assert_close(
+        explicit.compute_loss(hidden_states, targets, lengths),
+        legacy.compute_loss(hidden_states, targets, lengths),
+        rtol=0,
+        atol=0,
+    )
+    torch.manual_seed(10)
+    expected = legacy.predict_codes(hidden_states, temperature=0.7)
+    torch.manual_seed(10)
+    torch.testing.assert_close(explicit.predict_codes(hidden_states, temperature=0.7), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("stacking_factor", [1, 2, 4])
+def test_frame_major_loss_and_sampling_use_canonical_channels(stacking_factor):
+    predictor = _make_predictor(
+        prediction_order="frame_major", frame_stacking_factor=stacking_factor, prediction_schedule=(1,) * NUM_CODES
+    )
+    order = [
+        codebook * stacking_factor + frame
+        for frame in range(stacking_factor)
+        for codebook in range(NUM_CODES // stacking_factor)
+    ]
+    assert [block.codebook_indices for block in predictor.blocks] == [(index,) for index in order]
+    # Channel-specific deterministic heads expose incorrect target selection or output placement.
+    targets = torch.arange(NUM_CODES).view(1, 1, NUM_CODES).expand(2, 3, -1).clone()
+    targets[..., -1] = AUDIO_EOS_ID
+    with torch.no_grad():
+        for block in predictor.blocks:
+            channel = block.codebook_indices[0]
+            token = channel if channel != NUM_CODES - 1 else CODEBOOK_SIZE
+            block.codebook_projection.weight.zero_()
+            block.codebook_projection.bias.fill_(-10)
+            block.codebook_projection.bias[token] = 10
+
+    hidden_states = torch.randn(2, 3, D_MODEL)
+    loss = predictor.compute_loss(hidden_states, targets, torch.tensor([3, 3]))
+    assert loss < 1e-5
+    training_calls = list(predictor.embed_codes.calls)
+    predictor.embed_codes.calls.clear()
+    predicted = predictor.predict_codes(hidden_states, temperature=0.0)
+    torch.testing.assert_close(predicted, targets)
+    for calls in [training_calls, predictor.embed_codes.calls]:
+        assert len(calls) == NUM_CODES - 1
+        for (indices, codes), channel in zip(calls, order[:-1]):
+            assert indices == (channel,)
+            torch.testing.assert_close(codes, targets[..., channel : channel + 1].transpose(1, 2))
+
+
+@pytest.mark.parametrize("schedule", [SCHEDULE, (1, 1, 6), (8,)])
+def test_frame_major_rejects_grouped_schedules(schedule):
+    with pytest.raises(ValueError, match="requires .* to contain only ones"):
+        _make_predictor(prediction_order="frame_major", frame_stacking_factor=2, prediction_schedule=schedule)
+
+
+def test_prediction_order_must_be_supported():
+    with pytest.raises(ValueError, match="Unsupported acoustic_codes_predictor_order"):
+        _make_predictor(prediction_order="unknown")
+
+
+@pytest.mark.parametrize("stacking_factor", [0, -1, 3, 2.0, True])
+def test_prediction_order_requires_valid_stacking_factor(stacking_factor):
+    with pytest.raises(ValueError, match="frame_stacking_factor must be a positive integer"):
+        _make_predictor(frame_stacking_factor=stacking_factor)
+
+
 def test_target_channels_must_match_schedule():
     predictor = _make_predictor()
     with pytest.raises(AssertionError, match="target has 7 codes"):
@@ -215,13 +292,15 @@ def test_predictor_does_not_take_backbone_code_predictions():
     assert codes.shape == (2, 1, NUM_CODES)
 
 
-def test_cached_streaming_matches_whole_sequence_prediction():
+@pytest.mark.parametrize("prediction_order", ["codebook_major", "frame_major"])
+def test_cached_streaming_matches_whole_sequence_prediction(prediction_order):
     torch.manual_seed(1)
     hidden_states = torch.randn(2, 6, D_MODEL)
 
-    whole = _make_predictor().predict_codes(hidden_states, temperature=0.0)
+    kwargs = dict(prediction_order=prediction_order, frame_stacking_factor=2, prediction_schedule=(1,) * NUM_CODES)
+    whole = _make_predictor(**kwargs).predict_codes(hidden_states, temperature=0.0)
 
-    predictor = _make_predictor()
+    predictor = _make_predictor(**kwargs)
     cache = _cache(predictor, batch_size=2)
     streamed = torch.cat(
         [
@@ -235,16 +314,18 @@ def test_cached_streaming_matches_whole_sequence_prediction():
     torch.testing.assert_close(streamed, whole)
 
 
-def test_skipped_prediction_populates_the_same_cache_as_advance():
+@pytest.mark.parametrize("prediction_order", ["codebook_major", "frame_major"])
+def test_skipped_prediction_populates_the_same_cache_as_advance(prediction_order):
     torch.manual_seed(2)
     hidden_states = torch.randn(1, 3, D_MODEL)
 
-    advanced = _make_predictor()
+    kwargs = dict(prediction_order=prediction_order, frame_stacking_factor=2, prediction_schedule=(1,) * NUM_CODES)
+    advanced = _make_predictor(**kwargs)
     advanced_cache = _cache(advanced, batch_size=1)
     advanced.advance(hidden_states[:, :2], cache=advanced_cache)
     after_advance = advanced.predict_codes(hidden_states[:, 2:], cache=advanced_cache, temperature=0.0)
 
-    skipped = _make_predictor()
+    skipped = _make_predictor(**kwargs)
     skipped_cache = _cache(skipped, batch_size=1)
     for frame in range(2):
         codes = skipped.predict_codes(

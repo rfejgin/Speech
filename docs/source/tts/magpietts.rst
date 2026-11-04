@@ -31,6 +31,42 @@ This two-stage approach delivers significant speed improvements for two reasons.
 The Local Transformer handles the prediction of tokens across multiple codebooks within each time frame. The audio codec uses multiple codebooks to represent audio at different levels of detail, and the Local Transformer can operate in either autoregressive mode, where codebooks are predicted sequentially, or MaskGit mode, which uses iterative parallel decoding for even faster inference. When frame stacking is enabled, using the Local Transformer is typically necessary to maintain high synthesis quality.
 
 
+EasyMagpie Acoustic Predictor Order
+----------------------------------
+
+EasyMagpie's Nemotron-H acoustic predictor supports configurable prediction order within
+each frame stack. This option applies when ``acoustic_codes_predictor: true`` and
+``local_transformer_type: none``. The default ``acoustic_codes_predictor_order: codebook_major``
+preserves existing behavior, including checkpoints whose configuration omits the option.
+With two stacked frames and an all-ones schedule, it predicts
+``f0c0, f1c0, f0c1, f1c1, ...``. Grouped schedules predict consecutive channels together.
+
+To predict every codebook of the first frame before proceeding to the second frame,
+set ``acoustic_codes_predictor_order: frame_major``. For eight codec codebooks and two
+stacked frames, use:
+
+.. code-block:: yaml
+
+    model:
+      acoustic_codes_predictor: true
+      local_transformer_type: none
+      frame_stacking_factor: 2
+      acoustic_codes_predictor_order: frame_major
+      acoustic_codes_predictor_schedule: [1, 1, 1, 1, 1, 1, 1, 1,
+                                          1, 1, 1, 1, 1, 1, 1, 1]
+
+This predicts ``f0c0, f0c1, ..., f0c7, f1c0, f1c1, ..., f1c7``. Frame-major order
+requires one predictor block per stacked channel: every schedule entry must be one,
+and the entry count must equal the codec codebook count times the stacking factor.
+Other frame-major schedules raise an error. Codebook-major order continues to support
+grouped schedules. The number of layers inside each block remains controlled by
+``acoustic_codes_predictor_n_layers``.
+
+Training and inference use the same model configuration. Stacked targets and returned
+codes retain their codebook-major layout in both modes. Train or fine-tune with the
+chosen order; changing the order only at inference does not convert an existing model.
+
+
 Model Configurations
 --------------------
 
